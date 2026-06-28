@@ -1,0 +1,8 @@
+data
+coverage
+.env
+.env.*
+.git
+*.md
+docs
+deploy

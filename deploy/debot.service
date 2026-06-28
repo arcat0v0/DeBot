@@ -1,0 +1,21 @@
+[Unit]
+Description=DeBot multi-cloud Telegram operations bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=debot
+Group=debot
+WorkingDirectory=/opt/debot
+EnvironmentFile=/opt/debot/.env
+ExecStart=/usr/local/bin/deno run --allow-net --allow-env --allow-read --allow-write /opt/debot/src/main.ts
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/debot/data
+
+[Install]
+WantedBy=multi-user.target

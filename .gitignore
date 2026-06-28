@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+
+data/
+coverage/
+dist/
+
+.DS_Store
