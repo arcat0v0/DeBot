@@ -89,7 +89,7 @@ export class AzureAdapter implements ProviderAdapter {
   readonly id = "azure" as const;
   readonly label = "Azure";
   private readonly auth: AzureAuth;
-  private readonly subscriptionId: string;
+  private subscriptionId?: string;
   private readonly resourceGroup?: string;
   private readonly fetchImpl: FetchLike;
 
@@ -98,6 +98,23 @@ export class AzureAdapter implements ProviderAdapter {
     this.subscriptionId = ctx.credentials.subscriptionId;
     this.resourceGroup = ctx.credentials.resourceGroup;
     this.auth = new AzureAuth(ctx.credentials, this.fetchImpl);
+  }
+
+  private async sub(): Promise<string> {
+    if (this.subscriptionId) return this.subscriptionId;
+    const data = await this.request<
+      { value: { subscriptionId: string; state?: string }[] }
+    >("GET", "/subscriptions", "2020-01-01");
+    const found = data.value.find((item) => item.state === "Enabled") ??
+      data.value[0];
+    if (!found) {
+      throw new ProviderError("azure", "no accessible subscription", {
+        userMessage:
+          "该服务主体没有可访问的订阅，请确认已为其分配订阅范围的角色。",
+      });
+    }
+    this.subscriptionId = found.subscriptionId;
+    return this.subscriptionId;
   }
 
   private async request<T>(
@@ -132,8 +149,8 @@ export class AzureAdapter implements ProviderAdapter {
     return rg;
   }
 
-  private vmPath(name: string, rg: string): string {
-    return `/subscriptions/${this.subscriptionId}/resourceGroups/${rg}` +
+  private vmPath(sub: string, name: string, rg: string): string {
+    return `/subscriptions/${sub}/resourceGroups/${rg}` +
       `/providers/Microsoft.Compute/virtualMachines/${name}`;
   }
 
@@ -150,32 +167,56 @@ export class AzureAdapter implements ProviderAdapter {
   }
 
   async listRegions(): Promise<string[]> {
+    const sub = await this.sub();
     const data = await this.request<{ value: { name: string }[] }>(
       "GET",
-      `/subscriptions/${this.subscriptionId}/locations`,
+      `/subscriptions/${sub}/locations`,
       "2022-12-01",
     );
     return data.value.map((location) => location.name);
   }
 
   async listInstances(_opts?: ListOptions): Promise<InstanceList> {
-    const path = this.resourceGroup
-      ? `/subscriptions/${this.subscriptionId}/resourceGroups/${this.resourceGroup}` +
-        `/providers/Microsoft.Compute/virtualMachines`
-      : `/subscriptions/${this.subscriptionId}/providers/Microsoft.Compute/virtualMachines`;
+    const sub = await this.sub();
+    if (this.resourceGroup) {
+      const data = await this.request<{ value: AzureVm[] }>(
+        "GET",
+        `/subscriptions/${sub}/resourceGroups/${this.resourceGroup}` +
+          `/providers/Microsoft.Compute/virtualMachines?$expand=instanceView`,
+        COMPUTE_API,
+      );
+      return { instances: (data.value ?? []).map(mapVm) };
+    }
     const data = await this.request<{ value: AzureVm[] }>(
       "GET",
-      `${path}?$expand=instanceView`,
+      `/subscriptions/${sub}/providers/Microsoft.Compute/virtualMachines`,
       COMPUTE_API,
     );
-    return { instances: (data.value ?? []).map(mapVm) };
+    const instances: Instance[] = [];
+    for (const vm of data.value ?? []) {
+      if (vm.id) {
+        try {
+          const view = await this.request<{ statuses?: AzureStatus[] }>(
+            "GET",
+            `${vm.id}/instanceView`,
+            COMPUTE_API,
+          );
+          vm.properties = { ...vm.properties, instanceView: view };
+        } catch {
+          void 0;
+        }
+      }
+      instances.push(mapVm(vm));
+    }
+    return { instances };
   }
 
   async getInstance(id: string, locator?: InstanceLocator): Promise<Instance> {
     const rg = this.requireResourceGroup(locator);
+    const sub = await this.sub();
     const raw = await this.request<AzureVm>(
       "GET",
-      `${this.vmPath(id, rg)}?$expand=instanceView`,
+      `${this.vmPath(sub, id, rg)}?$expand=instanceView`,
       COMPUTE_API,
     );
     if (!raw?.name) throw new NotFoundError(`virtual machine ${id} not found`);
@@ -184,26 +225,38 @@ export class AzureAdapter implements ProviderAdapter {
 
   async startInstance(id: string, locator?: InstanceLocator): Promise<void> {
     const rg = this.requireResourceGroup(locator);
-    await this.request("POST", `${this.vmPath(id, rg)}/start`, COMPUTE_API);
+    const sub = await this.sub();
+    await this.request(
+      "POST",
+      `${this.vmPath(sub, id, rg)}/start`,
+      COMPUTE_API,
+    );
   }
 
   async stopInstance(id: string, locator?: InstanceLocator): Promise<void> {
     const rg = this.requireResourceGroup(locator);
+    const sub = await this.sub();
     await this.request(
       "POST",
-      `${this.vmPath(id, rg)}/deallocate`,
+      `${this.vmPath(sub, id, rg)}/deallocate`,
       COMPUTE_API,
     );
   }
 
   async rebootInstance(id: string, locator?: InstanceLocator): Promise<void> {
     const rg = this.requireResourceGroup(locator);
-    await this.request("POST", `${this.vmPath(id, rg)}/restart`, COMPUTE_API);
+    const sub = await this.sub();
+    await this.request(
+      "POST",
+      `${this.vmPath(sub, id, rg)}/restart`,
+      COMPUTE_API,
+    );
   }
 
   async deleteInstance(id: string, locator?: InstanceLocator): Promise<void> {
     const rg = this.requireResourceGroup(locator);
-    await this.request("DELETE", this.vmPath(id, rg), COMPUTE_API);
+    const sub = await this.sub();
+    await this.request("DELETE", this.vmPath(sub, id, rg), COMPUTE_API);
   }
 
   renameInstance(): Promise<void> {
@@ -232,8 +285,8 @@ export class AzureAdapter implements ProviderAdapter {
     }
     const name = input.name ?? `debot-${Date.now()}`;
     const imageRef = parseImageReference(input.image);
-    const base =
-      `/subscriptions/${this.subscriptionId}/resourceGroups/${rg}/providers`;
+    const sub = await this.sub();
+    const base = `/subscriptions/${sub}/resourceGroups/${rg}/providers`;
 
     const pipName = `${name}-ip`;
     const pip = await this.request<{ id: string }>(
@@ -286,7 +339,7 @@ export class AzureAdapter implements ProviderAdapter {
       },
     );
 
-    await this.request("PUT", this.vmPath(name, rg), COMPUTE_API, {
+    await this.request("PUT", this.vmPath(sub, name, rg), COMPUTE_API, {
       location,
       tags: input.tags,
       properties: {

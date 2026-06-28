@@ -102,7 +102,7 @@ export interface AzureCredentials {
   tenantId: string;
   clientId: string;
   clientSecret: string;
-  subscriptionId: string;
+  subscriptionId?: string;
   resourceGroup?: string;
 }
 

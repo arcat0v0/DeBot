@@ -60,35 +60,36 @@ function parseAzure(text: string): ParsedCredentials {
   const json = tryJson(text);
   if (json) {
     const credentials: AzureCredentials = {
-      tenantId: str(json.tenantId) ?? "",
-      clientId: str(json.clientId) ?? str(json.appId) ?? "",
-      clientSecret: str(json.clientSecret) ?? str(json.password) ?? "",
-      subscriptionId: str(json.subscriptionId) ?? "",
+      tenantId: str(json.tenant) ?? str(json.tenantId) ?? "",
+      clientId: str(json.appId) ?? str(json.clientId) ?? "",
+      clientSecret: str(json.password) ?? str(json.clientSecret) ?? "",
     };
+    const subscriptionId = str(json.subscriptionId) ?? str(json.subscription);
+    if (subscriptionId) credentials.subscriptionId = subscriptionId;
     const resourceGroup = str(json.resourceGroup);
     if (resourceGroup) credentials.resourceGroup = resourceGroup;
     if (
       !credentials.tenantId || !credentials.clientId ||
-      !credentials.clientSecret || !credentials.subscriptionId
+      !credentials.clientSecret
     ) {
       throw new ValidationError(
-        "Azure 需要 tenantId、clientId、clientSecret 和 subscriptionId",
+        "Azure 需要 tenant(appOwnerTenantId)、appId 和 password",
       );
     }
     return { credentials };
   }
   const parts = text.trim().split(/[\s,]+/).filter((part) => part.length > 0);
-  if (parts.length < 4) {
+  if (parts.length < 3) {
     throw new ValidationError(
-      "请发送：tenantId clientId clientSecret 订阅ID [资源组]",
+      "请发送 az ad sp create-for-rbac 的 JSON，或：tenant appId password [订阅ID] [资源组]",
     );
   }
   const credentials: AzureCredentials = {
     tenantId: parts[0],
     clientId: parts[1],
     clientSecret: parts[2],
-    subscriptionId: parts[3],
   };
+  if (parts[3]) credentials.subscriptionId = parts[3];
   if (parts[4]) credentials.resourceGroup = parts[4];
   return { credentials };
 }
