@@ -1,3 +1,4 @@
+import { delay } from "@std/async";
 import {
   NotFoundError,
   ProviderError,
@@ -37,8 +38,50 @@ interface AzureVm {
       imageReference?: { publisher?: string; offer?: string; sku?: string };
     };
     instanceView?: { statuses?: AzureStatus[] };
+    networkProfile?: { networkInterfaces?: { id?: string }[] };
   };
 }
+
+interface AzureSubnet {
+  name?: string;
+  properties?: {
+    addressPrefix?: string;
+    addressPrefixes?: string[];
+  };
+}
+
+interface AzureVnet {
+  properties?: {
+    addressSpace?: { addressPrefixes?: string[] };
+    subnets?: AzureSubnet[];
+  };
+}
+
+interface AzureIpConfig {
+  name?: string;
+  properties?: {
+    privateIPAddressVersion?: string;
+    primary?: boolean;
+    subnet?: { id?: string };
+    publicIPAddress?: { id?: string };
+  };
+}
+
+interface AzureNic {
+  properties?: {
+    ipConfigurations?: AzureIpConfig[];
+  };
+}
+
+interface AzurePublicIp {
+  properties?: {
+    ipAddress?: string;
+    provisioningState?: string;
+  };
+}
+
+const IPV6_VNET_PREFIX = "ace:cab:deca::/48";
+const IPV6_SUBNET_PREFIX = "ace:cab:deca:deed::/64";
 
 function resourceGroupFromId(id: string | undefined): string | undefined {
   if (!id) return undefined;
@@ -72,16 +115,16 @@ function mapVm(raw: AzureVm): Instance {
   const imageLabel = image
     ? [image.publisher, image.offer, image.sku].filter(Boolean).join(":")
     : undefined;
+  const resourceGroup = resourceGroupFromId(raw.id);
   return {
     id: raw.name ?? "",
     name: raw.name ?? "",
     state: mapPowerState(raw.properties?.instanceView?.statuses),
     region: raw.location,
+    resourceGroup,
     size: raw.properties?.hardwareProfile?.vmSize,
     image: imageLabel,
-    tags: resourceGroupFromId(raw.id)
-      ? { resourceGroup: resourceGroupFromId(raw.id)! }
-      : undefined,
+    tags: resourceGroup ? { resourceGroup } : undefined,
   };
 }
 
@@ -138,9 +181,7 @@ export class AzureAdapter implements ProviderAdapter {
   }
 
   private requireResourceGroup(locator?: InstanceLocator): string {
-    const rg = (locator?.region && locator.region.includes("/"))
-      ? undefined
-      : this.resourceGroup;
+    const rg = locator?.resourceGroup ?? this.resourceGroup;
     if (!rg) {
       throw new ValidationError(
         "Azure 操作需要资源组（resourceGroup），请在凭证中设置",
@@ -163,6 +204,7 @@ export class AzureAdapter implements ProviderAdapter {
       delete: true,
       rename: false,
       regions: true,
+      ipv6: true,
     };
   }
 
@@ -267,6 +309,133 @@ export class AzureAdapter implements ProviderAdapter {
         userMessage: "Azure 不支持重命名虚拟机。",
       },
     );
+  }
+
+  async addPublicIpv6(id: string, locator?: InstanceLocator): Promise<string> {
+    const rg = this.requireResourceGroup(locator);
+    const sub = await this.sub();
+    const vm = await this.request<AzureVm>(
+      "GET",
+      this.vmPath(sub, id, rg),
+      COMPUTE_API,
+    );
+    if (!vm?.name) throw new NotFoundError(`virtual machine ${id} not found`);
+    const location = vm.location;
+    const nicId = vm.properties?.networkProfile?.networkInterfaces?.[0]?.id;
+    if (!location || !nicId) {
+      throw new ProviderError("azure", "vm has no network interface", {
+        userMessage: "该虚拟机没有可用网卡，无法添加 IPv6。",
+      });
+    }
+
+    let nic = await this.request<AzureNic>("GET", nicId, NETWORK_API);
+    const subnetId = nic.properties?.ipConfigurations?.[0]?.properties?.subnet
+      ?.id;
+    if (!subnetId) {
+      throw new ProviderError("azure", "no subnet on nic", {
+        userMessage: "未找到网卡所在子网，无法添加 IPv6。",
+      });
+    }
+    const parsed = subnetId.match(
+      /virtualNetworks\/([^/]+)\/subnets\/([^/]+)/i,
+    );
+    if (!parsed) {
+      throw new ProviderError("azure", "cannot parse subnet id", {
+        userMessage: "无法解析子网信息，无法添加 IPv6。",
+      });
+    }
+    const vnetName = parsed[1];
+    const subnetName = parsed[2];
+    const vnetPath = `/subscriptions/${sub}/resourceGroups/${rg}` +
+      `/providers/Microsoft.Network/virtualNetworks/${vnetName}`;
+
+    const vnet = await this.request<AzureVnet>("GET", vnetPath, NETWORK_API);
+    const space = vnet.properties?.addressSpace?.addressPrefixes ?? [];
+    if (!space.some((prefix) => prefix.includes(":"))) {
+      space.push(IPV6_VNET_PREFIX);
+    }
+    if (vnet.properties?.addressSpace) {
+      vnet.properties.addressSpace.addressPrefixes = space;
+    }
+    const subnet = vnet.properties?.subnets?.find((item) =>
+      item.name === subnetName
+    );
+    if (!subnet?.properties) {
+      throw new ProviderError("azure", "subnet not found in vnet", {
+        userMessage: "在虚拟网络中找不到对应子网，无法添加 IPv6。",
+      });
+    }
+    const v4 = subnet.properties.addressPrefix ??
+      (subnet.properties.addressPrefixes ?? []).find((p) => !p.includes(":"));
+    if (!v4) {
+      throw new ProviderError("azure", "subnet has no ipv4 prefix", {
+        userMessage: "读不到子网现有 IPv4 段，已中止以免破坏 IPv4。",
+      });
+    }
+    subnet.properties.addressPrefixes = Array.from(
+      new Set([v4, IPV6_SUBNET_PREFIX]),
+    );
+    delete subnet.properties.addressPrefix;
+    await this.request("PUT", vnetPath, NETWORK_API, vnet);
+    await this.pollProvisioning(vnetPath, NETWORK_API);
+
+    const pipName = `${vm.name}-ipv6`;
+    const pipPath = `/subscriptions/${sub}/resourceGroups/${rg}` +
+      `/providers/Microsoft.Network/publicIPAddresses/${pipName}`;
+    await this.request("PUT", pipPath, NETWORK_API, {
+      location,
+      sku: { name: "Standard" },
+      properties: {
+        publicIPAllocationMethod: "Static",
+        publicIPAddressVersion: "IPv6",
+      },
+    });
+    await this.pollProvisioning(pipPath, NETWORK_API);
+
+    nic = await this.request<AzureNic>("GET", nicId, NETWORK_API);
+    const configs = nic.properties?.ipConfigurations ?? [];
+    if (!configs.some((cfg) => cfg.name === "ipv6config")) {
+      configs.push({
+        name: "ipv6config",
+        properties: {
+          privateIPAddressVersion: "IPv6",
+          primary: false,
+          subnet: { id: subnetId },
+          publicIPAddress: { id: pipPath },
+        },
+      });
+    }
+    if (nic.properties) nic.properties.ipConfigurations = configs;
+    await this.request("PUT", nicId, NETWORK_API, nic);
+    await this.pollProvisioning(nicId, NETWORK_API);
+
+    const pip = await this.request<AzurePublicIp>("GET", pipPath, NETWORK_API);
+    const address = pip.properties?.ipAddress;
+    if (!address) {
+      throw new ProviderError("azure", "ipv6 address not assigned", {
+        userMessage: "IPv6 已配置，但未能读取到地址，请稍后在面板查看。",
+      });
+    }
+    return address;
+  }
+
+  private async pollProvisioning(
+    path: string,
+    apiVersion: string,
+  ): Promise<void> {
+    for (let i = 0; i < 40; i++) {
+      const res = await this.request<
+        { properties?: { provisioningState?: string } }
+      >("GET", path, apiVersion);
+      const state = res.properties?.provisioningState;
+      if (state === "Succeeded") return;
+      if (state === "Failed") {
+        throw new ProviderError("azure", `provisioning failed: ${path}`, {
+          userMessage: "Azure 资源置备失败，请稍后重试。",
+        });
+      }
+      await delay(2000);
+    }
   }
 
   async createInstance(input: CreateInstanceInput): Promise<Instance> {

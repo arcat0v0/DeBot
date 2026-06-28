@@ -78,6 +78,9 @@ export function instanceDetail(
   if (instance.size) lines.push(`规格：${code(instance.size)}`);
   if (instance.image) lines.push(`镜像：${code(instance.image)}`);
   if (instance.publicIp) lines.push(`公网 IP：${code(instance.publicIp)}`);
+  if (instance.publicIpv6) {
+    lines.push(`公网 IPv6：${code(instance.publicIpv6)}`);
+  }
   if (instance.privateIp) lines.push(`内网 IP：${code(instance.privateIp)}`);
   if (instance.createdAt) lines.push(`创建时间：${code(instance.createdAt)}`);
   const tagKeys = Object.keys(instance.tags ?? {});

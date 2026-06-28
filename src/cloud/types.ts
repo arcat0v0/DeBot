@@ -30,9 +30,11 @@ export interface Instance {
   state: InstanceState;
   region?: string;
   zone?: string;
+  resourceGroup?: string;
   size?: string;
   image?: string;
   publicIp?: string;
+  publicIpv6?: string;
   privateIp?: string;
   createdAt?: string;
   tags?: Record<string, string>;
@@ -41,6 +43,7 @@ export interface Instance {
 export interface InstanceLocator {
   region?: string;
   zone?: string;
+  resourceGroup?: string;
 }
 
 export interface ListOptions extends InstanceLocator {
@@ -71,6 +74,7 @@ export interface Capabilities {
   delete: boolean;
   rename: boolean;
   regions: boolean;
+  ipv6: boolean;
 }
 
 export interface ProviderAdapter {
@@ -90,6 +94,7 @@ export interface ProviderAdapter {
     name: string,
     locator?: InstanceLocator,
   ): Promise<void>;
+  addPublicIpv6?(id: string, locator?: InstanceLocator): Promise<string>;
 }
 
 export interface AwsCredentials {

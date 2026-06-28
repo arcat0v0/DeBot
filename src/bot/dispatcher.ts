@@ -83,11 +83,12 @@ const CREDENTIAL_HINTS: Record<ProviderId, string> = {
   ].join("\n"),
   azure: [
     "🔑 <b>获取 Azure 凭证（服务主体）</b>",
-    "在装有 Azure CLI 的环境运行：",
+    "在装有 Azure CLI 的环境运行（先 <code>az login</code>）：",
     "<code>az ad sp create-for-rbac --name debot \\",
-    '  --role "Virtual Machine Contributor" \\',
-    "  --scopes /subscriptions/订阅ID</code>",
-    "把它输出的 JSON <b>整段</b>发给我即可，例如：",
+    '  --role "Contributor" \\',
+    "  --scopes /subscriptions/$(az account show --query id -o tsv)</code>",
+    "「Contributor（参与者）」一次性授予增删机器、加公网 IPv6 等全部所需权限，",
+    "无需后续再补授权。把它输出的 JSON <b>整段</b>发给我即可，例如：",
     "<code>{",
     '  "appId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",',
     '  "displayName": "debot",',
@@ -533,6 +534,7 @@ export class Dispatcher {
       state: instance.state,
       region: instance.region ?? region,
       zone: instance.zone,
+      resourceGroup: instance.resourceGroup,
     }));
     this.deps.sessions.setList(user.id, listKey(pc, sc), refs);
 
@@ -601,6 +603,9 @@ export class Dispatcher {
       case "rename":
         await this.beginRename(user, surface, provider, service, ref, ack);
         return;
+      case "ipv6":
+        await this.enqueueAddIpv6(user, surface, provider, service, ref, ack);
+        return;
       case "del":
         await this.confirmDelete(surface, provider, service, index, ref);
         return;
@@ -627,6 +632,7 @@ export class Dispatcher {
       instance = await adapter.getInstance(ref.instanceId, {
         region: ref.region,
         zone: ref.zone,
+        resourceGroup: ref.resourceGroup,
       });
     } catch {
       instance = {
@@ -635,6 +641,7 @@ export class Dispatcher {
         state: ref.state,
         region: ref.region,
         zone: ref.zone,
+        resourceGroup: ref.resourceGroup,
       };
     }
     const caps = adapter.capabilities();
@@ -652,6 +659,9 @@ export class Dispatcher {
     if (caps.rename) manageRow.push(button("✏️ 重命名", `${base}:rename`));
     if (caps.delete) manageRow.push(button("🗑 删除", `${base}:del`));
     if (manageRow.length > 0) rows.push(manageRow);
+    if (caps.ipv6 && adapter.addPublicIpv6) {
+      rows.push([button("🌐 添加公网 IPv6", `${base}:ipv6`)]);
+    }
     rows.push([
       button("🔄 刷新", `${base}:refresh`),
       button("⬅️ 返回", `ls:${pc}:${sc}`),
@@ -689,7 +699,11 @@ export class Dispatcher {
       service,
       region: ref.region,
     });
-    const locator = { region: ref.region, zone: ref.zone };
+    const locator = {
+      region: ref.region,
+      zone: ref.zone,
+      resourceGroup: ref.resourceGroup,
+    };
     if (verb === "start") await adapter.startInstance(ref.instanceId, locator);
     else if (verb === "stop") {
       await adapter.stopInstance(ref.instanceId, locator);
@@ -800,6 +814,7 @@ export class Dispatcher {
         await adapter.deleteInstance(ref.instanceId, {
           region: ref.region,
           zone: ref.zone,
+          resourceGroup: ref.resourceGroup,
         });
         return `已删除 ${ref.name}`;
       },
@@ -807,6 +822,42 @@ export class Dispatcher {
         this.editJobMessage(surface, provider, service, label, record),
     });
     await ack("删除任务已加入队列");
+    this.editJobMessage(surface, provider, service, label, job);
+  }
+
+  private async enqueueAddIpv6(
+    user: TgUser,
+    surface: Surface,
+    provider: ProviderId,
+    service: string,
+    ref: ListItemRef,
+    ack: (text?: string, alert?: boolean) => Promise<void>,
+  ): Promise<void> {
+    const label = `为 ${ref.name} 添加公网 IPv6`;
+    const job = this.deps.jobs.enqueue({
+      kind: "ipv6",
+      label,
+      provider,
+      userId: user.id,
+      run: async () => {
+        const adapter = await this.deps.cloud.getAdapter(provider, {
+          service,
+          region: ref.region,
+        });
+        if (!adapter.addPublicIpv6) {
+          throw new Error("该服务商不支持添加公网 IPv6");
+        }
+        const address = await adapter.addPublicIpv6(ref.instanceId, {
+          region: ref.region,
+          zone: ref.zone,
+          resourceGroup: ref.resourceGroup,
+        });
+        return `已为 ${ref.name} 添加公网 IPv6：${address}`;
+      },
+      onUpdate: (record) =>
+        this.editJobMessage(surface, provider, service, label, record),
+    });
+    await ack("已加入队列，正在配置公网 IPv6…");
     this.editJobMessage(surface, provider, service, label, job);
   }
 

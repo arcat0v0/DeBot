@@ -113,6 +113,7 @@ export class LightsailAdapter implements ProviderAdapter {
       delete: true,
       rename: false,
       regions: true,
+      ipv6: false,
     };
   }
 

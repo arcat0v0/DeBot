@@ -7,6 +7,7 @@ export interface ListItemRef {
   state: InstanceState;
   region?: string;
   zone?: string;
+  resourceGroup?: string;
 }
 
 export type Flow =
