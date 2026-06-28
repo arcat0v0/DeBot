@@ -4,7 +4,7 @@ set -euo pipefail
 REPO="arcat0v0/DeBot"
 NAME="debot"
 BINDIR="${DEBOT_BINDIR:-$HOME/.local/bin}"
-WORKDIR="${DEBOT_HOME:-$HOME/.local/share/debot}"
+WORKDIR="${DEBOT_HOME:-$HOME/.config/debot}"
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m  %s\n' "$*"; }
