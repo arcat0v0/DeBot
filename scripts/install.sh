@@ -70,7 +70,7 @@ main() {
   "$BINDIR/$NAME" version >/dev/null 2>&1 ||
     die "二进制无法运行（若为 Alpine 请先安装 gcompat libstdc++）。"
 
-  env_file="$WORKDIR/.env"
+  env_file="$WORKDIR/config.env"
   if [ -f "$env_file" ]; then
     say "已存在配置 $env_file，跳过引导。"
   else
