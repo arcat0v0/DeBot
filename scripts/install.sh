@@ -75,13 +75,16 @@ main() {
     say "已存在配置 $env_file，跳过引导。"
   else
     say "配置 Telegram 机器人："
-    echo "  1) 在 Telegram 找 @BotFather 创建机器人，获取 Bot Token"
-    echo "  2) 找 @userinfobot 获取你的数字用户 ID"
+    echo "  1) 在 Telegram 找 @BotFather 创建机器人，复制它给的 Bot Token"
+    echo "  2) 准备你的数字用户 ID（白名单，决定谁能使用机器人）："
+    echo "       方法A：给 @userinfobot 发任意消息，它会回复形如 123456789 的 ID"
+    echo "       方法B：此项留空，安装后给你的机器人发 /start，"
+    echo "              机器人会回复你的用户 ID，再填入并执行 $NAME restart"
     echo
     token="${TELEGRAM_BOT_TOKEN:-}"
     users="${DEBOT_ALLOWED_USERS:-}"
     [ -n "$token" ] || ask "Bot Token: " token
-    [ -n "$users" ] || ask "允许使用的用户 ID（逗号分隔）: " users
+    [ -n "$users" ] || ask "允许使用的用户 ID（逗号分隔，可留空）: " users
     [ -n "$token" ] || die "Bot Token 不能为空。"
     key="$("$BINDIR/$NAME" genkey)"
     (
@@ -95,6 +98,8 @@ DEBOT_LOG_LEVEL=info
 EOF
     )
     say "已写入 $env_file（权限 600）"
+    [ -n "$users" ] ||
+      warn "用户 ID 留空：稍后给机器人发 /start，它会回复你的 ID；填入 $env_file 的 DEBOT_ALLOWED_USERS 后执行 $NAME restart。"
   fi
 
   say "安装并启动服务 …"

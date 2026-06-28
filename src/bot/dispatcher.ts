@@ -166,11 +166,14 @@ export class Dispatcher {
   private async handleMessage(message: TgMessage): Promise<void> {
     const user = message.from;
     if (!this.authorized(user)) {
+      const idLine = user ? `\n你的用户 ID：<code>${user.id}</code>` : "";
       await this.deps.api.sendMessage({
         chat_id: message.chat.id,
-        text: this.deps.allowedUsers.length === 0
-          ? "DeBot 尚未配置白名单。请将你的 Telegram 用户 ID 写入 DEBOT_ALLOWED_USERS。"
-          : "你没有使用此机器人的权限。",
+        text: (this.deps.allowedUsers.length === 0
+          ? "DeBot 尚未配置白名单。把下面的用户 ID 填入 DEBOT_ALLOWED_USERS（可多个，逗号分隔）后重启即可使用。"
+          : "你没有使用此机器人的权限。如需开通，请把下面的用户 ID 交给管理员加入白名单。") +
+          idLine,
+        parse_mode: "HTML",
       });
       return;
     }
@@ -226,7 +229,7 @@ export class Dispatcher {
     if (!this.authorized(query.from)) {
       await this.deps.api.answerCallbackQuery({
         callback_query_id: query.id,
-        text: "无权使用",
+        text: `无权使用（你的 ID：${query.from.id}）`,
         show_alert: true,
       });
       return;
