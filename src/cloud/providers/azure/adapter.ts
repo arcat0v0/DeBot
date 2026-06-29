@@ -663,16 +663,23 @@ export class AzureAdapter implements ProviderAdapter {
     );
   }
 
-  private async listResourceSkus(): Promise<AzureResourceSku[]> {
+  private async listResourceSkus(
+    names?: readonly string[],
+  ): Promise<AzureResourceSku[]> {
     const sub = await this.sub();
     let url: string | undefined =
       `${BASE}/subscriptions/${sub}/providers/Microsoft.Compute/skus?api-version=${RESOURCE_SKU_API}`;
+    const wantedNames = names ? new Set(names) : undefined;
     const out: AzureResourceSku[] = [];
     while (url) {
       const page: AzureResourceSkuPage = await this.requestUrl<
         AzureResourceSkuPage
       >("GET", url);
-      out.push(...(page.value ?? []));
+      for (const sku of page.value ?? []) {
+        if (sku.resourceType !== "virtualMachines" || !sku.name) continue;
+        if (wantedNames && !wantedNames.has(sku.name)) continue;
+        out.push(sku);
+      }
       url = page.nextLink;
     }
     return out;
@@ -683,14 +690,10 @@ export class AzureAdapter implements ProviderAdapter {
   ): Promise<RegionAvailability[]> {
     const [regions, skus] = await Promise.all([
       this.listRegionInfo(),
-      this.listResourceSkus(),
+      this.listResourceSkus(sizes),
     ]);
     const skuMap = new Map<string, AzureResourceSku[]>();
-    for (
-      const sku of skus.filter((sku) =>
-        sku.resourceType === "virtualMachines" && sku.name
-      )
-    ) {
+    for (const sku of skus) {
       const list = skuMap.get(sku.name!) ?? [];
       list.push(sku);
       skuMap.set(sku.name!, list);

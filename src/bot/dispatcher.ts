@@ -268,6 +268,11 @@ function formatAmount(amount: number | undefined, currency?: string): string {
   return currency ? `${value} ${currency}` : value;
 }
 
+function shouldAckCallbackBeforeRoute(data: string): boolean {
+  const head = data.split(":", 1)[0];
+  return head === "az" || head === "rg";
+}
+
 function subscriptionInfoText(info: SubscriptionInfo): string {
   const lines = [bold("Azure 订阅类型")];
   lines.push(`订阅 ID：${code(info.id)}`);
@@ -475,9 +480,17 @@ export class Dispatcher {
     };
 
     try {
+      if (shouldAckCallbackBeforeRoute(data)) {
+        await ack("正在处理...");
+      }
       await this.routeCallback(query.from, surface, data, ack);
     } catch (error) {
-      await ack(toUserMessage(error), true);
+      const message = toUserMessage(error);
+      if (acked) {
+        await this.showMenu(surface, `操作失败：${escapeHtml(message)}`);
+      } else {
+        await ack(message, true);
+      }
       this.deps.logger.error("callback failed", {
         data,
         error: error instanceof Error ? error.message : String(error),

@@ -174,6 +174,34 @@ class AzureFeatureMockAdapter extends MockAdapter {
   }
 }
 
+class SlowAzureSubscriptionMockAdapter extends AzureFeatureMockAdapter {
+  gate: Promise<void> = Promise.resolve();
+
+  override async getSubscriptionInfo(): Promise<SubscriptionInfo> {
+    await this.gate;
+    return await super.getSubscriptionInfo();
+  }
+}
+
+class SlowAzureRegionsMockAdapter extends AzureFeatureMockAdapter {
+  gate: Promise<void> = Promise.resolve();
+
+  override async listRegions(): Promise<string[]> {
+    await this.gate;
+    return ["eastasia", "westus"];
+  }
+}
+
+function deferred<T = void>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 function message(text: string, userId = USER): TgUpdate {
   return {
     update_id: 1,
@@ -419,6 +447,84 @@ Deno.test("azure subscription tools and student default create are available", a
       recent.some((job) => job.kind === "create" && job.status === "succeeded"),
     );
   } finally {
+    await cleanup(dir);
+  }
+});
+
+Deno.test("azure info callbacks are acknowledged before slow API calls", async () => {
+  const gate = deferred();
+  const azure = new SlowAzureSubscriptionMockAdapter({
+    id: "azure",
+    label: "Mock Azure",
+  });
+  azure.gate = gate.promise;
+  const { dir, api, dispatcher, profiles } = await setup(
+    [USER],
+    (provider) =>
+      provider === "azure"
+        ? azure
+        : new MockAdapter({ id: provider, label: `Mock ${provider}` }),
+  );
+  try {
+    await profiles.add({
+      name: "primary",
+      provider: "azure",
+      credentials: {
+        tenantId: "tenant",
+        clientId: "client",
+        clientSecret: "secret",
+        subscriptionId: "sub",
+      },
+    });
+
+    const pending = dispatcher.handleUpdate(callback("az:z:x:sub"));
+    assertEquals(api.answers.length, 1);
+    assertEquals(api.answers[0].text, "正在处理...");
+    assertEquals(api.edits.length, 0);
+    gate.resolve();
+    await pending;
+    assert(api.lastEditText().includes("学生订阅：是"));
+  } finally {
+    gate.resolve();
+    await cleanup(dir);
+  }
+});
+
+Deno.test("azure region picker is acknowledged before loading regions", async () => {
+  const gate = deferred();
+  const azure = new SlowAzureRegionsMockAdapter({
+    id: "azure",
+    label: "Mock Azure",
+  });
+  azure.gate = gate.promise;
+  const { dir, api, dispatcher, profiles } = await setup(
+    [USER],
+    (provider) =>
+      provider === "azure"
+        ? azure
+        : new MockAdapter({ id: provider, label: `Mock ${provider}` }),
+  );
+  try {
+    await profiles.add({
+      name: "primary",
+      provider: "azure",
+      credentials: {
+        tenantId: "tenant",
+        clientId: "client",
+        clientSecret: "secret",
+        subscriptionId: "sub",
+      },
+    });
+
+    const pending = dispatcher.handleUpdate(callback("rg:z:x"));
+    assertEquals(api.answers.length, 1);
+    assertEquals(api.answers[0].text, "正在处理...");
+    assertEquals(api.edits.length, 0);
+    gate.resolve();
+    await pending;
+    assert(api.lastEditText().includes("请选择区域"));
+  } finally {
+    gate.resolve();
     await cleanup(dir);
   }
 });

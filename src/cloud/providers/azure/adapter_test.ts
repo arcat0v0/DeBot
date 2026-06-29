@@ -187,33 +187,51 @@ Deno.test("AzureAdapter reports subscription info, cost and student SKU regions"
       url.pathname ===
         `/subscriptions/${SUB}/providers/Microsoft.Compute/skus`
     ) {
+      if (url.searchParams.get("page") === "2") {
+        return Response.json({
+          value: [
+            {
+              name: "Standard_B1s",
+              resourceType: "virtualMachines",
+              locations: ["eastasia", "westus"],
+              restrictions: [
+                {
+                  type: "Location",
+                  values: ["westus"],
+                  reasonCode: "NotAvailableForSubscription",
+                },
+              ],
+            },
+            {
+              name: "Standard_B2ats_v2",
+              resourceType: "virtualMachines",
+              locations: ["EastAsia"],
+              restrictions: [
+                {
+                  type: "Zone",
+                  values: ["EastAsia"],
+                  reasonCode: "NotAvailableForSubscription",
+                },
+              ],
+            },
+          ],
+        });
+      }
       return Response.json({
         value: [
           {
-            name: "Standard_B1s",
+            name: "Standard_D64s_v5",
             resourceType: "virtualMachines",
-            locations: ["eastasia", "westus"],
-            restrictions: [
-              {
-                type: "Location",
-                values: ["westus"],
-                reasonCode: "NotAvailableForSubscription",
-              },
-            ],
+            locations: ["eastasia"],
           },
           {
-            name: "Standard_B2ats_v2",
-            resourceType: "virtualMachines",
-            locations: ["EastAsia"],
-            restrictions: [
-              {
-                type: "Zone",
-                values: ["EastAsia"],
-                reasonCode: "NotAvailableForSubscription",
-              },
-            ],
+            name: "Standard_B1s",
+            resourceType: "disks",
+            locations: ["westus"],
           },
         ],
+        nextLink:
+          `https://management.azure.com/subscriptions/${SUB}/providers/Microsoft.Compute/skus?api-version=2023-09-01&page=2`,
       });
     }
     if (
