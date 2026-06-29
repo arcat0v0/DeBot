@@ -10,6 +10,11 @@ import type {
   AdapterContext,
   Capabilities,
   CreateInstanceInput,
+  FirewallAccess,
+  FirewallDirection,
+  FirewallProtocol,
+  FirewallRule,
+  FirewallRuleInput,
   Instance,
   InstanceList,
   InstanceLocator,
@@ -47,6 +52,7 @@ interface AzureSubnet {
   properties?: {
     addressPrefix?: string;
     addressPrefixes?: string[];
+    networkSecurityGroup?: { id?: string };
   };
 }
 
@@ -68,8 +74,10 @@ interface AzureIpConfig {
 }
 
 interface AzureNic {
+  id?: string;
   properties?: {
     ipConfigurations?: AzureIpConfig[];
+    networkSecurityGroup?: { id?: string };
   };
 }
 
@@ -77,6 +85,34 @@ interface AzurePublicIp {
   properties?: {
     ipAddress?: string;
     provisioningState?: string;
+  };
+}
+
+interface AzureSecurityRule {
+  id?: string;
+  name?: string;
+  properties?: {
+    access?: string;
+    description?: string;
+    destinationAddressPrefix?: string;
+    destinationAddressPrefixes?: string[];
+    destinationPortRange?: string;
+    destinationPortRanges?: string[];
+    direction?: string;
+    priority?: number;
+    protocol?: string;
+    sourceAddressPrefix?: string;
+    sourceAddressPrefixes?: string[];
+  };
+}
+
+interface AzureNetworkSecurityGroup {
+  id?: string;
+  name?: string;
+  location?: string;
+  properties?: {
+    provisioningState?: string;
+    securityRules?: AzureSecurityRule[];
   };
 }
 
@@ -126,6 +162,77 @@ function mapVm(raw: AzureVm): Instance {
     image: imageLabel,
     tags: resourceGroup ? { resourceGroup } : undefined,
   };
+}
+
+function oneOrMany(
+  one: string | undefined,
+  many: string[] | undefined,
+): string | undefined {
+  if (many && many.length > 0) return many.join(",");
+  return one;
+}
+
+function mapFirewallProtocol(value: string | undefined): FirewallProtocol {
+  switch (value?.toLowerCase()) {
+    case "tcp":
+      return "Tcp";
+    case "udp":
+      return "Udp";
+    case "icmp":
+      return "Icmp";
+    default:
+      return "*";
+  }
+}
+
+function mapFirewallAccess(value: string | undefined): FirewallAccess {
+  return value === "Deny" ? "Deny" : "Allow";
+}
+
+function mapFirewallDirection(value: string | undefined): FirewallDirection {
+  return value === "Outbound" ? "Outbound" : "Inbound";
+}
+
+function mapSecurityRule(raw: AzureSecurityRule): FirewallRule {
+  const props = raw.properties ?? {};
+  return {
+    id: raw.id,
+    name: raw.name ?? "",
+    direction: mapFirewallDirection(props.direction),
+    access: mapFirewallAccess(props.access),
+    protocol: mapFirewallProtocol(props.protocol),
+    source: oneOrMany(
+      props.sourceAddressPrefix,
+      props.sourceAddressPrefixes,
+    ),
+    destination: oneOrMany(
+      props.destinationAddressPrefix,
+      props.destinationAddressPrefixes,
+    ),
+    ports: oneOrMany(
+      props.destinationPortRange,
+      props.destinationPortRanges,
+    ),
+    priority: props.priority,
+    description: props.description,
+  };
+}
+
+function nextSecurityRulePriority(rules: AzureSecurityRule[]): number {
+  const used = new Set(
+    rules
+      .map((rule) => rule.properties?.priority)
+      .filter((priority): priority is number => priority !== undefined),
+  );
+  for (let priority = 1000; priority <= 4096; priority += 10) {
+    if (!used.has(priority)) return priority;
+  }
+  for (let priority = 100; priority <= 4096; priority++) {
+    if (!used.has(priority)) return priority;
+  }
+  throw new ProviderError("azure", "no available NSG rule priority", {
+    userMessage: "该 NSG 已没有可用规则优先级。",
+  });
 }
 
 export class AzureAdapter implements ProviderAdapter {
@@ -195,6 +302,63 @@ export class AzureAdapter implements ProviderAdapter {
       `/providers/Microsoft.Compute/virtualMachines/${name}`;
   }
 
+  private nsgPath(sub: string, rg: string, name: string): string {
+    return `/subscriptions/${sub}/resourceGroups/${rg}` +
+      `/providers/Microsoft.Network/networkSecurityGroups/${name}`;
+  }
+
+  private securityRulePath(nsgId: string, ruleName: string): string {
+    return `${nsgId}/securityRules/${encodeURIComponent(ruleName)}`;
+  }
+
+  private async primaryNic(
+    id: string,
+    rg: string,
+  ): Promise<{ sub: string; vm: AzureVm; nicId: string; nic: AzureNic }> {
+    const sub = await this.sub();
+    const vm = await this.request<AzureVm>(
+      "GET",
+      this.vmPath(sub, id, rg),
+      COMPUTE_API,
+    );
+    if (!vm?.name) throw new NotFoundError(`virtual machine ${id} not found`);
+    const nicId = vm.properties?.networkProfile?.networkInterfaces?.[0]?.id;
+    if (!nicId) {
+      throw new ProviderError("azure", "vm has no network interface", {
+        userMessage: "该虚拟机没有可用网卡，无法管理防火墙。",
+      });
+    }
+    const nic = await this.request<AzureNic>("GET", nicId, NETWORK_API);
+    return { sub, vm, nicId, nic };
+  }
+
+  private async nicNetworkSecurityGroup(
+    id: string,
+    rg: string,
+    create: boolean,
+  ): Promise<string | undefined> {
+    const { sub, vm, nicId, nic } = await this.primaryNic(id, rg);
+    const existing = nic.properties?.networkSecurityGroup?.id;
+    if (existing) return existing;
+    if (!create) return undefined;
+    if (!vm.location || !vm.name) {
+      throw new ProviderError("azure", "vm location is missing", {
+        userMessage: "无法读取虚拟机区域，无法创建 NSG。",
+      });
+    }
+    const nsgId = this.nsgPath(sub, rg, `${vm.name}-nsg`);
+    await this.request("PUT", nsgId, NETWORK_API, {
+      location: vm.location,
+      properties: { securityRules: [] },
+    });
+    await this.pollProvisioning(nsgId, NETWORK_API);
+    if (!nic.properties) nic.properties = {};
+    nic.properties.networkSecurityGroup = { id: nsgId };
+    await this.request("PUT", nicId, NETWORK_API, nic);
+    await this.pollProvisioning(nicId, NETWORK_API);
+    return nsgId;
+  }
+
   capabilities(): Capabilities {
     return {
       create: true,
@@ -205,6 +369,7 @@ export class AzureAdapter implements ProviderAdapter {
       rename: false,
       regions: true,
       ipv6: true,
+      firewall: true,
     };
   }
 
@@ -309,6 +474,90 @@ export class AzureAdapter implements ProviderAdapter {
         userMessage: "Azure 不支持重命名虚拟机。",
       },
     );
+  }
+
+  async listFirewallRules(
+    id: string,
+    locator?: InstanceLocator,
+  ): Promise<FirewallRule[]> {
+    const rg = this.requireResourceGroup(locator);
+    const nsgId = await this.nicNetworkSecurityGroup(id, rg, false);
+    if (!nsgId) return [];
+    const nsg = await this.request<AzureNetworkSecurityGroup>(
+      "GET",
+      nsgId,
+      NETWORK_API,
+    );
+    return (nsg.properties?.securityRules ?? [])
+      .map(mapSecurityRule)
+      .filter((rule) => rule.direction === "Inbound")
+      .sort((a, b) => (a.priority ?? 0) - (b.priority ?? 0));
+  }
+
+  async addFirewallRule(
+    id: string,
+    rule: FirewallRuleInput,
+    locator?: InstanceLocator,
+  ): Promise<FirewallRule> {
+    const rg = this.requireResourceGroup(locator);
+    const nsgId = await this.nicNetworkSecurityGroup(id, rg, true);
+    if (!nsgId) {
+      throw new ProviderError("azure", "network security group not found", {
+        userMessage: "未找到或创建网卡 NSG。",
+      });
+    }
+    const nsg = await this.request<AzureNetworkSecurityGroup>(
+      "GET",
+      nsgId,
+      NETWORK_API,
+    );
+    const rules = nsg.properties?.securityRules ?? [];
+    const name = rule.name ??
+      `debot-${rule.protocol.toLowerCase()}-${rule.port.replace("*", "all")}`;
+    const existing = rules.find((item) => item.name === name);
+    const priority = existing?.properties?.priority ??
+      nextSecurityRulePriority(rules);
+    const saved = await this.request<AzureSecurityRule>(
+      "PUT",
+      this.securityRulePath(nsgId, name),
+      NETWORK_API,
+      {
+        properties: {
+          access: "Allow",
+          description: rule.description,
+          destinationAddressPrefix: "*",
+          destinationPortRange: rule.port,
+          direction: "Inbound",
+          priority,
+          protocol: rule.protocol,
+          sourceAddressPrefix: rule.source ?? "*",
+          sourcePortRange: "*",
+        },
+      },
+    );
+    await this.pollProvisioning(nsgId, NETWORK_API);
+    return mapSecurityRule(saved);
+  }
+
+  async deleteFirewallRule(
+    id: string,
+    ruleName: string,
+    locator?: InstanceLocator,
+  ): Promise<void> {
+    const rg = this.requireResourceGroup(locator);
+    const nsgId = await this.nicNetworkSecurityGroup(id, rg, false);
+    if (!nsgId) {
+      throw new NotFoundError(
+        "network security group not found",
+        "未找到网卡 NSG。",
+      );
+    }
+    await this.request(
+      "DELETE",
+      this.securityRulePath(nsgId, ruleName),
+      NETWORK_API,
+    );
+    await this.pollProvisioning(nsgId, NETWORK_API);
   }
 
   async addPublicIpv6(id: string, locator?: InstanceLocator): Promise<string> {

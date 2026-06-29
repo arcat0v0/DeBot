@@ -128,6 +128,7 @@ export class Ec2Adapter implements ProviderAdapter {
       rename: true,
       regions: true,
       ipv6: false,
+      firewall: false,
     };
   }
 

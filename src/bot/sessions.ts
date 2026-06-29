@@ -1,5 +1,6 @@
 import type { ProviderId } from "../cloud/types.ts";
 import type { InstanceState } from "../cloud/types.ts";
+import type { FirewallAccess, FirewallProtocol } from "../cloud/types.ts";
 
 export interface ListItemRef {
   instanceId: string;
@@ -8,6 +9,15 @@ export interface ListItemRef {
   region?: string;
   zone?: string;
   resourceGroup?: string;
+}
+
+export interface FirewallRuleRef {
+  name: string;
+  protocol: FirewallProtocol;
+  access: FirewallAccess;
+  ports?: string;
+  source?: string;
+  priority?: number;
 }
 
 export type Flow =
@@ -23,12 +33,25 @@ export type Flow =
     chatId: number;
     messageId: number;
   }
+  | {
+    kind: "add_firewall_rule";
+    provider: ProviderId;
+    service: string;
+    instanceId: string;
+    name: string;
+    region?: string;
+    zone?: string;
+    resourceGroup?: string;
+    chatId: number;
+    messageId: number;
+  }
   | { kind: "add_preset"; provider: ProviderId };
 
 export interface Session {
   userId: number;
   flow?: Flow;
   lists: Map<string, ListItemRef[]>;
+  firewallRules: Map<string, FirewallRuleRef[]>;
   regionOverride: Partial<Record<ProviderId, string>>;
 }
 
@@ -38,7 +61,12 @@ export class SessionStore {
   get(userId: number): Session {
     let session = this.sessions.get(userId);
     if (!session) {
-      session = { userId, lists: new Map(), regionOverride: {} };
+      session = {
+        userId,
+        lists: new Map(),
+        firewallRules: new Map(),
+        regionOverride: {},
+      };
       this.sessions.set(userId, session);
     }
     return session;
@@ -62,6 +90,22 @@ export class SessionStore {
     index: number,
   ): ListItemRef | undefined {
     return this.get(userId).lists.get(key)?.[index];
+  }
+
+  setFirewallRules(
+    userId: number,
+    key: string,
+    rules: FirewallRuleRef[],
+  ): void {
+    this.get(userId).firewallRules.set(key, rules);
+  }
+
+  getFirewallRule(
+    userId: number,
+    key: string,
+    index: number,
+  ): FirewallRuleRef | undefined {
+    return this.get(userId).firewallRules.get(key)?.[index];
   }
 
   setRegion(userId: number, provider: ProviderId, region: string): void {

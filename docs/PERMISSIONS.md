@@ -90,13 +90,14 @@ or JSON:
 ```
 
 `resourceGroup` is required for per-VM actions (start/stop/restart/delete) and
-for creating VMs.
+for creating VMs and managing VM firewall rules.
 
 **Role**
 
 Assign the service principal a scoped role on the resource group, e.g. the
 built-in **Virtual Machine Contributor** plus **Network Contributor** (creation
-provisions a public IP, virtual network and NIC). For read/lifecycle only,
+provisions a public IP, virtual network and NIC; firewall management reads,
+creates and updates NIC-level Network Security Groups). For read/lifecycle only,
 Virtual Machine Contributor is sufficient.
 
 Create a service principal:
@@ -106,6 +107,21 @@ az ad sp create-for-rbac --name debot \
   --role "Virtual Machine Contributor" \
   --scopes /subscriptions/<sub>/resourceGroups/<rg>
 ```
+
+If you want DeBot to create VMs, add public IPv6, or manage Azure firewall
+rules, also grant **Network Contributor** on the same resource group.
+
+**Firewall behavior**
+
+Azure firewall management operates on the virtual machine's primary NIC Network
+Security Group (NSG):
+
+- Existing custom inbound rules on the NIC NSG are listed.
+- Opening a port creates or updates an inbound allow rule.
+- If the NIC has no NSG, DeBot creates `<vm-name>-nsg` and attaches it to that
+  NIC. Azure's default NSG rules then deny other inbound ports unless explicit
+  allow rules exist.
+- Deleting a rule only removes custom rules from the NIC NSG.
 
 **Presets**
 

@@ -41,6 +41,7 @@ export class MockAdapter implements ProviderAdapter {
       rename: true,
       regions: true,
       ipv6: false,
+      firewall: false,
     };
   }
 

@@ -110,6 +110,7 @@ export class DigitalOceanAdapter implements ProviderAdapter {
       rename: true,
       regions: true,
       ipv6: false,
+      firewall: false,
     };
   }
 

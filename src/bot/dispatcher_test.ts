@@ -11,7 +11,13 @@ import { JobQueue } from "../jobs/queue.ts";
 import { CloudService } from "../cloud/service.ts";
 import type { AdapterFactory } from "../cloud/service.ts";
 import { MockAdapter } from "../cloud/providers/mock.ts";
-import type { ProviderId } from "../cloud/types.ts";
+import type {
+  Capabilities,
+  FirewallRule,
+  FirewallRuleInput,
+  InstanceLocator,
+  ProviderId,
+} from "../cloud/types.ts";
 import { SessionStore } from "./sessions.ts";
 import { Dispatcher } from "./dispatcher.ts";
 import type {
@@ -58,6 +64,48 @@ class FakeApi implements BotApi {
 
 const USER = 123;
 
+class FirewallMockAdapter extends MockAdapter {
+  rules: FirewallRule[] = [];
+
+  override capabilities(): Capabilities {
+    return { ...super.capabilities(), firewall: true };
+  }
+
+  listFirewallRules(): Promise<FirewallRule[]> {
+    return Promise.resolve(this.rules.map((rule) => ({ ...rule })));
+  }
+
+  addFirewallRule(
+    _id: string,
+    input: FirewallRuleInput,
+    _locator?: InstanceLocator,
+  ): Promise<FirewallRule> {
+    const existing = this.rules.find((rule) => rule.name === input.name);
+    const rule: FirewallRule = {
+      name: input.name ?? "rule",
+      direction: "Inbound",
+      access: "Allow",
+      protocol: input.protocol,
+      source: input.source,
+      ports: input.port,
+      priority: existing?.priority ?? 1000 + this.rules.length * 10,
+      description: input.description,
+    };
+    if (existing) Object.assign(existing, rule);
+    else this.rules.push(rule);
+    return Promise.resolve({ ...rule });
+  }
+
+  deleteFirewallRule(
+    _id: string,
+    ruleName: string,
+    _locator?: InstanceLocator,
+  ): Promise<void> {
+    this.rules = this.rules.filter((rule) => rule.name !== ruleName);
+    return Promise.resolve();
+  }
+}
+
 function message(text: string, userId = USER): TgUpdate {
   return {
     update_id: 1,
@@ -87,7 +135,7 @@ function callback(data: string, userId = USER): TgUpdate {
   };
 }
 
-async function setup(allowed = [USER]) {
+async function setup(allowed = [USER], factoryOverride?: AdapterFactory) {
   const dir = await Deno.makeTempDir();
   const key = await importMasterKey(generateMasterKeyBase64());
   const profiles = new ProfileStore(dir, key);
@@ -96,14 +144,14 @@ async function setup(allowed = [USER]) {
   const logger = createLogger("error", {}, () => {});
   const jobs = new JobQueue(jobStore, logger);
   const adapters = new Map<ProviderId, MockAdapter>();
-  const factory: AdapterFactory = (provider) => {
+  const factory: AdapterFactory = factoryOverride ?? ((provider) => {
     let adapter = adapters.get(provider);
     if (!adapter) {
       adapter = new MockAdapter({ id: provider, label: `Mock ${provider}` });
       adapters.set(provider, adapter);
     }
     return adapter;
-  };
+  });
   const cloud = new CloudService(profiles, fetch, factory);
   const api = new FakeApi();
   const dispatcher = new Dispatcher({
@@ -193,6 +241,53 @@ Deno.test("delete requires confirmation and runs as a job", async () => {
     assert(
       recent.some((job) => job.kind === "delete" && job.status === "succeeded"),
     );
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+Deno.test("azure firewall rules can be added and deleted", async () => {
+  const firewall = new FirewallMockAdapter({
+    id: "azure",
+    label: "Mock Azure",
+  });
+  const { dir, api, dispatcher, profiles } = await setup(
+    [USER],
+    (provider) =>
+      provider === "azure"
+        ? firewall
+        : new MockAdapter({ id: provider, label: `Mock ${provider}` }),
+  );
+  try {
+    await profiles.add({
+      name: "primary",
+      provider: "azure",
+      credentials: {
+        tenantId: "tenant",
+        clientId: "client",
+        clientSecret: "secret",
+        subscriptionId: "sub",
+        resourceGroup: "rg",
+      },
+    });
+
+    await dispatcher.handleUpdate(callback("ls:z:x"));
+    await dispatcher.handleUpdate(callback("fw:z:x:0"));
+    assert(api.lastEditText().includes("Azure 防火墙"));
+
+    await dispatcher.handleUpdate(callback("fw:z:x:0:add"));
+    assert(api.lastSendText().includes("开放的端口规则"));
+
+    await dispatcher.handleUpdate(message("tcp 22 ssh"));
+    assertEquals(firewall.rules.length, 1);
+    assertEquals(firewall.rules[0].source, "*");
+    assert(api.lastEditText().includes("ssh"));
+
+    await dispatcher.handleUpdate(callback("fw:z:x:0:del:0"));
+    assert(api.lastEditText().includes("确认删除防火墙规则"));
+
+    await dispatcher.handleUpdate(callback("fw:z:x:0:delok:0"));
+    assertEquals(firewall.rules.length, 0);
   } finally {
     await cleanup(dir);
   }

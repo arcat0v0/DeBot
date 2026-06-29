@@ -1,4 +1,4 @@
-import type { Instance, InstanceState } from "../cloud/types.ts";
+import type { FirewallRule, Instance, InstanceState } from "../cloud/types.ts";
 import type { JobRecord } from "../jobs/types.ts";
 
 export function escapeHtml(text: string): string {
@@ -87,6 +87,54 @@ export function instanceDetail(
   if (tagKeys.length > 0) {
     lines.push(`标签：${escapeHtml(tagKeys.join(", "))}`);
   }
+  return lines.join("\n");
+}
+
+function firewallRulePort(rule: FirewallRule): string {
+  return rule.ports ?? "*";
+}
+
+function firewallRuleSource(rule: FirewallRule): string {
+  return rule.source ?? "*";
+}
+
+export function firewallRuleLabel(rule: FirewallRule): string {
+  const action = rule.access === "Allow" ? "允许" : "拒绝";
+  return `${action} ${rule.protocol} ${firewallRulePort(rule)}`;
+}
+
+export function firewallRuleLine(rule: FirewallRule): string {
+  const priority = rule.priority === undefined ? "" : ` #${rule.priority}`;
+  return [
+    `• ${escapeHtml(rule.name)}${priority}`,
+    `${escapeHtml(firewallRuleLabel(rule))}`,
+    `来源 ${code(firewallRuleSource(rule))}`,
+  ].join(" · ");
+}
+
+export function firewallRulesDetail(
+  rules: FirewallRule[],
+  instanceName: string,
+): string {
+  const lines = [
+    bold("Azure 防火墙"),
+    `机器：${code(instanceName)}`,
+    "",
+  ];
+  if (rules.length === 0) {
+    lines.push(
+      "暂无网卡 NSG 自定义入站规则。",
+      "开放端口时会自动创建或更新该机器网卡绑定的 NSG。",
+    );
+  } else {
+    for (const rule of rules) lines.push(firewallRuleLine(rule));
+  }
+  lines.push(
+    "",
+    "新增格式：",
+    `${code("tcp 22 0.0.0.0/0 ssh")}`,
+    "来源和名称可省略，来源默认 *。",
+  );
   return lines.join("\n");
 }
 

@@ -25,6 +25,8 @@ On Alpine (musl) install `apk add gcompat libstdc++` first. See
 - Telegram bot with inline-keyboard menus and confirmation prompts.
 - Provider-neutral instance lifecycle: list, detail, start, stop, reboot,
   delete, rename (where supported) and create-from-preset.
+- Azure VM firewall management through NIC-level Network Security Group inbound
+  rules.
 - Four providers via direct REST APIs (no heavyweight SDKs):
   - **AWS EC2** — SigV4-signed Query API.
   - **AWS Lightsail** — SigV4-signed JSON API.

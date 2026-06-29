@@ -66,6 +66,31 @@ export interface CreateInstanceInput {
   userData?: string;
 }
 
+export type FirewallProtocol = "Tcp" | "Udp" | "Icmp" | "*";
+export type FirewallAccess = "Allow" | "Deny";
+export type FirewallDirection = "Inbound" | "Outbound";
+
+export interface FirewallRule {
+  id?: string;
+  name: string;
+  direction: FirewallDirection;
+  access: FirewallAccess;
+  protocol: FirewallProtocol;
+  source?: string;
+  destination?: string;
+  ports?: string;
+  priority?: number;
+  description?: string;
+}
+
+export interface FirewallRuleInput {
+  name?: string;
+  protocol: FirewallProtocol;
+  port: string;
+  source?: string;
+  description?: string;
+}
+
 export interface Capabilities {
   create: boolean;
   start: boolean;
@@ -75,6 +100,7 @@ export interface Capabilities {
   rename: boolean;
   regions: boolean;
   ipv6: boolean;
+  firewall: boolean;
 }
 
 export interface ProviderAdapter {
@@ -95,6 +121,20 @@ export interface ProviderAdapter {
     locator?: InstanceLocator,
   ): Promise<void>;
   addPublicIpv6?(id: string, locator?: InstanceLocator): Promise<string>;
+  listFirewallRules?(
+    id: string,
+    locator?: InstanceLocator,
+  ): Promise<FirewallRule[]>;
+  addFirewallRule?(
+    id: string,
+    rule: FirewallRuleInput,
+    locator?: InstanceLocator,
+  ): Promise<FirewallRule>;
+  deleteFirewallRule?(
+    id: string,
+    ruleName: string,
+    locator?: InstanceLocator,
+  ): Promise<void>;
 }
 
 export interface AwsCredentials {

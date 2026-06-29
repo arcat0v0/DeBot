@@ -1,7 +1,12 @@
 import type { Logger } from "../app/logger.ts";
 import { toUserMessage } from "../shared/errors.ts";
 import { PROVIDER_IDS, PROVIDER_LABELS } from "../cloud/types.ts";
-import type { Instance, ProviderId } from "../cloud/types.ts";
+import type {
+  FirewallProtocol,
+  FirewallRuleInput,
+  Instance,
+  ProviderId,
+} from "../cloud/types.ts";
 import type { CloudService } from "../cloud/service.ts";
 import { providerServices } from "../cloud/registry.ts";
 import type { ProfileStore } from "../storage/profiles.ts";
@@ -24,6 +29,8 @@ import {
   bold,
   code,
   escapeHtml,
+  firewallRuleLabel,
+  firewallRulesDetail,
   instanceButtonLabel,
   instanceDetail,
   jobLine,
@@ -37,6 +44,7 @@ import {
 } from "./codes.ts";
 import { parseCredentials } from "./credentials.ts";
 import { parsePresetLine, PRESET_FORMAT } from "./presetform.ts";
+import type { FirewallRuleRef } from "./sessions.ts";
 
 export interface BotDeps {
   api: BotApi;
@@ -114,6 +122,97 @@ const CREDENTIAL_HINTS: Record<ProviderId, string> = {
     "然后把 token 直接发给我。",
   ].join("\n"),
 };
+
+function firewallKey(
+  provider: ProviderId,
+  service: string,
+  instanceId: string,
+) {
+  return `${providerCode(provider)}:${serviceCode(service)}:${instanceId}`;
+}
+
+function sanitizeFirewallRuleName(value: string): string {
+  const name = value
+    .trim()
+    .replace(/[^A-Za-z0-9_.-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  return name || "debot-rule";
+}
+
+function normalizeFirewallProtocol(
+  value: string,
+): FirewallProtocol | undefined {
+  switch (value.toLowerCase()) {
+    case "tcp":
+      return "Tcp";
+    case "udp":
+      return "Udp";
+    case "icmp":
+      return "Icmp";
+    case "all":
+    case "*":
+      return "*";
+    default:
+      return undefined;
+  }
+}
+
+function validateFirewallPort(port: string): void {
+  if (port === "*") return;
+  const parts = port.split("-");
+  if (parts.length > 2 || parts.some((part) => !/^\d+$/.test(part))) {
+    throw new Error("端口格式应为 22、8000-9000 或 *");
+  }
+  const nums = parts.map((part) => Number.parseInt(part, 10));
+  if (nums.some((num) => num < 1 || num > 65535)) {
+    throw new Error("端口范围必须在 1-65535 之间");
+  }
+  if (nums.length === 2 && nums[0] > nums[1]) {
+    throw new Error("端口范围起点不能大于终点");
+  }
+}
+
+function looksLikeFirewallSource(value: string): boolean {
+  const lower = value.toLowerCase();
+  if (
+    value === "*" ||
+    lower === "internet" ||
+    lower === "virtualnetwork" ||
+    lower === "azureloadbalancer"
+  ) {
+    return true;
+  }
+  if (/^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/.test(value)) return true;
+  return value.includes(":");
+}
+
+function parseFirewallRuleInput(text: string): FirewallRuleInput {
+  const tokens = text.trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) throw new Error("请发送要开放的端口规则");
+  const firstProtocol = normalizeFirewallProtocol(tokens[0]);
+  const protocol = firstProtocol ?? "Tcp";
+  if (firstProtocol) tokens.shift();
+  const port = tokens.shift() ?? (protocol === "Icmp" ? "*" : "");
+  if (!port) throw new Error("请填写端口，例如 tcp 22");
+  validateFirewallPort(port);
+  const source = tokens[0] && looksLikeFirewallSource(tokens[0])
+    ? tokens.shift()
+    : "*";
+  const name = sanitizeFirewallRuleName(
+    tokens.join("-") ||
+      `debot-${protocol.toLowerCase().replace("*", "all")}-${
+        port.replace("*", "all")
+      }`,
+  );
+  return {
+    name,
+    protocol,
+    port,
+    source,
+    description: "Created by DeBot",
+  };
+}
 
 export class Dispatcher {
   constructor(private readonly deps: BotDeps) {}
@@ -322,6 +421,9 @@ export class Dispatcher {
         return;
       case "i":
         await this.handleInstanceCallback(user, surface, parts, ack);
+        return;
+      case "fw":
+        await this.handleFirewallCallback(user, surface, parts, ack);
         return;
       case "cr":
         await this.showCreateMenu(
@@ -617,6 +719,225 @@ export class Dispatcher {
     }
   }
 
+  private async handleFirewallCallback(
+    user: TgUser,
+    surface: Surface,
+    parts: string[],
+    ack: (text?: string, alert?: boolean) => Promise<void>,
+  ): Promise<void> {
+    const provider = decodeProvider(parts[1]);
+    const service = decodeService(parts[2]);
+    const index = Number.parseInt(parts[3], 10);
+    const action = parts[4];
+    const pc = providerCode(provider);
+    const sc = serviceCode(service);
+    const ref = this.deps.sessions.getListItem(user.id, listKey(pc, sc), index);
+    if (!ref) {
+      await ack("列表已过期，正在刷新", true);
+      await this.showList(user, surface, provider, service);
+      return;
+    }
+    if (!action || action === "refresh") {
+      await this.showFirewall(user, surface, provider, service, ref);
+      return;
+    }
+    if (action === "add") {
+      await this.beginAddFirewallRule(
+        user,
+        surface,
+        provider,
+        service,
+        ref,
+        ack,
+      );
+      return;
+    }
+    if (action === "del") {
+      const ruleIndex = Number.parseInt(parts[5], 10);
+      await this.confirmDeleteFirewallRule(
+        user,
+        surface,
+        provider,
+        service,
+        index,
+        ref,
+        ruleIndex,
+        ack,
+      );
+      return;
+    }
+    if (action === "delok") {
+      const ruleIndex = Number.parseInt(parts[5], 10);
+      await this.deleteFirewallRule(
+        user,
+        surface,
+        provider,
+        service,
+        ref,
+        ruleIndex,
+        ack,
+      );
+      return;
+    }
+    await this.showFirewall(user, surface, provider, service, ref);
+  }
+
+  private async showFirewall(
+    user: TgUser,
+    surface: Surface,
+    provider: ProviderId,
+    service: string,
+    ref: ListItemRef,
+  ): Promise<void> {
+    const adapter = await this.deps.cloud.getAdapter(provider, {
+      service,
+      region: ref.region,
+    });
+    if (
+      !adapter.listFirewallRules || !adapter.addFirewallRule ||
+      !adapter.deleteFirewallRule
+    ) {
+      throw new Error("该服务商不支持防火墙管理");
+    }
+    const rules = await adapter.listFirewallRules(ref.instanceId, {
+      region: ref.region,
+      zone: ref.zone,
+      resourceGroup: ref.resourceGroup,
+    });
+    const pc = providerCode(provider);
+    const sc = serviceCode(service);
+    const index = this.indexOf(surface, provider, service, ref);
+    const key = firewallKey(provider, service, ref.instanceId);
+    const refs: FirewallRuleRef[] = rules.map((rule) => ({
+      name: rule.name,
+      protocol: rule.protocol,
+      access: rule.access,
+      ports: rule.ports,
+      source: rule.source,
+      priority: rule.priority,
+    }));
+    this.deps.sessions.setFirewallRules(user.id, key, refs);
+    const base = `fw:${pc}:${sc}:${index}`;
+    const rows = [[button("➕ 开放端口", `${base}:add`)]];
+    for (let i = 0; i < Math.min(rules.length, 20); i++) {
+      rows.push([button(`🗑 ${rules[i].name}`, `${base}:del:${i}`)]);
+    }
+    rows.push([
+      button("🔄 刷新", `${base}:refresh`),
+      button("⬅️ 返回", `i:${pc}:${sc}:${index}`),
+    ]);
+    await this.showMenu(
+      surface,
+      firewallRulesDetail(rules, ref.name),
+      keyboard(rows),
+    );
+  }
+
+  private async beginAddFirewallRule(
+    user: TgUser,
+    surface: Surface,
+    provider: ProviderId,
+    service: string,
+    ref: ListItemRef,
+    ack: (text?: string, alert?: boolean) => Promise<void>,
+  ): Promise<void> {
+    if (surface.messageId === undefined) return;
+    this.deps.sessions.setFlow(user.id, {
+      kind: "add_firewall_rule",
+      provider,
+      service,
+      instanceId: ref.instanceId,
+      name: ref.name,
+      region: ref.region,
+      zone: ref.zone,
+      resourceGroup: ref.resourceGroup,
+      chatId: surface.chatId,
+      messageId: surface.messageId,
+    });
+    await ack();
+    await this.deps.api.sendMessage({
+      chat_id: surface.chatId,
+      text: [
+        `请发送 ${code(ref.name)} 要开放的端口规则：`,
+        code("tcp 22 0.0.0.0/0 ssh"),
+        "",
+        "格式：协议 端口 来源 名称",
+        "来源和名称可省略，来源默认 *。",
+        "如果该网卡尚未绑定 NSG，会自动创建一个网卡级 NSG；Azure 默认会拒绝其他未允许的入站端口。",
+      ].join("\n"),
+      parse_mode: "HTML",
+    });
+  }
+
+  private async confirmDeleteFirewallRule(
+    user: TgUser,
+    surface: Surface,
+    provider: ProviderId,
+    service: string,
+    index: number,
+    ref: ListItemRef,
+    ruleIndex: number,
+    ack: (text?: string, alert?: boolean) => Promise<void>,
+  ): Promise<void> {
+    const rule = this.deps.sessions.getFirewallRule(
+      user.id,
+      firewallKey(provider, service, ref.instanceId),
+      ruleIndex,
+    );
+    if (!rule) {
+      await ack("规则列表已过期，正在刷新", true);
+      await this.showFirewall(user, surface, provider, service, ref);
+      return;
+    }
+    const pc = providerCode(provider);
+    const sc = serviceCode(service);
+    await this.showMenu(
+      surface,
+      `${bold("确认删除防火墙规则")}\n\n确定要删除 ${code(rule.name)}（${
+        escapeHtml(rule.protocol)
+      } ${code(rule.ports ?? "*")}）吗？`,
+      keyboard([
+        [button("✅ 确认删除", `fw:${pc}:${sc}:${index}:delok:${ruleIndex}`)],
+        [button("❌ 取消", `fw:${pc}:${sc}:${index}`)],
+      ]),
+    );
+  }
+
+  private async deleteFirewallRule(
+    user: TgUser,
+    surface: Surface,
+    provider: ProviderId,
+    service: string,
+    ref: ListItemRef,
+    ruleIndex: number,
+    ack: (text?: string, alert?: boolean) => Promise<void>,
+  ): Promise<void> {
+    const rule = this.deps.sessions.getFirewallRule(
+      user.id,
+      firewallKey(provider, service, ref.instanceId),
+      ruleIndex,
+    );
+    if (!rule) {
+      await ack("规则列表已过期，正在刷新", true);
+      await this.showFirewall(user, surface, provider, service, ref);
+      return;
+    }
+    const adapter = await this.deps.cloud.getAdapter(provider, {
+      service,
+      region: ref.region,
+    });
+    if (!adapter.deleteFirewallRule) {
+      throw new Error("该服务商不支持删除防火墙规则");
+    }
+    await adapter.deleteFirewallRule(ref.instanceId, rule.name, {
+      region: ref.region,
+      zone: ref.zone,
+      resourceGroup: ref.resourceGroup,
+    });
+    await ack(`已删除 ${rule.name}`);
+    await this.showFirewall(user, surface, provider, service, ref);
+  }
+
   private async showDetail(
     surface: Surface,
     provider: ProviderId,
@@ -661,6 +982,12 @@ export class Dispatcher {
     if (manageRow.length > 0) rows.push(manageRow);
     if (caps.ipv6 && adapter.addPublicIpv6) {
       rows.push([button("🌐 添加公网 IPv6", `${base}:ipv6`)]);
+    }
+    if (
+      caps.firewall && adapter.listFirewallRules && adapter.addFirewallRule &&
+      adapter.deleteFirewallRule
+    ) {
+      rows.push([button("🧱 防火墙", `fw:${pc}:${sc}:${index}`)]);
     }
     rows.push([
       button("🔄 刷新", `${base}:refresh`),
@@ -1161,6 +1488,55 @@ export class Dispatcher {
         parse_mode: "HTML",
       });
       await this.showPresets(surface);
+      return;
+    }
+
+    if (flow.kind === "add_firewall_rule") {
+      let input: FirewallRuleInput;
+      try {
+        input = parseFirewallRuleInput(text);
+      } catch (error) {
+        await this.deps.api.sendMessage({
+          chat_id: surface.chatId,
+          text: `规则格式不正确：${escapeHtml(toUserMessage(error))}`,
+          parse_mode: "HTML",
+        });
+        return;
+      }
+      const adapter = await this.deps.cloud.getAdapter(flow.provider, {
+        service: flow.service,
+        region: flow.region,
+      });
+      if (!adapter.addFirewallRule) {
+        throw new Error("该服务商不支持防火墙管理");
+      }
+      const rule = await adapter.addFirewallRule(flow.instanceId, input, {
+        region: flow.region,
+        zone: flow.zone,
+        resourceGroup: flow.resourceGroup,
+      });
+      this.deps.sessions.clearFlow(user.id);
+      await this.deps.api.sendMessage({
+        chat_id: surface.chatId,
+        text: `✅ 已添加防火墙规则 ${code(rule.name)}：${
+          escapeHtml(firewallRuleLabel(rule))
+        }`,
+        parse_mode: "HTML",
+      });
+      await this.showFirewall(
+        user,
+        { chatId: flow.chatId, messageId: flow.messageId },
+        flow.provider,
+        flow.service,
+        {
+          instanceId: flow.instanceId,
+          name: flow.name,
+          state: "unknown",
+          region: flow.region,
+          zone: flow.zone,
+          resourceGroup: flow.resourceGroup,
+        },
+      );
       return;
     }
 
