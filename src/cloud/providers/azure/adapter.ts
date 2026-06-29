@@ -36,9 +36,11 @@ const NETWORK_API = "2023-09-01";
 const SUBSCRIPTION_API = "2022-12-01";
 const RESOURCE_GROUP_API = "2022-09-01";
 const RESOURCE_SKU_API = "2023-09-01";
-const COST_MANAGEMENT_API = "2023-11-01";
+const COST_MANAGEMENT_API = "2025-03-01";
 const BILLING_API = "2024-04-01";
+const BILLING_ACCOUNT_EXPAND_API = "2019-10-01-preview";
 const CONSUMPTION_API = "2024-08-01";
+const CONSUMPTION_CREDITS_API = "2023-03-01";
 const AZURE_STUDENT_FREE_SIZES = [
   "Standard_B1s",
   "Standard_B2ats_v2",
@@ -65,6 +67,8 @@ const AZURE_STUDENT_ARM_IMAGE =
   "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-arm64:latest";
 const AZURE_STUDENT_OS_DISK_SIZE_GB = 64;
 const AZURE_STUDENT_OS_DISK_STORAGE = "Premium_LRS";
+
+type CreditLines = NonNullable<SubscriptionBalance["credit"]>;
 
 interface AzureStatus {
   code?: string;
@@ -114,11 +118,64 @@ interface AzureResourceSkuPage {
   nextLink?: string;
 }
 
+interface AzureMoney {
+  amount?: number;
+  value?: number;
+  currency?: string;
+}
+
 interface AzureCreditSummary {
+  properties?: {
+    balanceSummary?: {
+      availableBalance?: AzureMoney;
+      currentBalance?: AzureMoney;
+      estimatedBalance?: AzureMoney;
+    };
+    billingCurrency?: string;
+    creditCurrency?: string;
+  };
   balanceSummary?: {
-    availableBalance?: { amount?: number; currency?: string };
-    currentBalance?: { amount?: number; currency?: string };
-    estimatedBalance?: { amount?: number; currency?: string };
+    availableBalance?: AzureMoney;
+    currentBalance?: AzureMoney;
+    estimatedBalance?: AzureMoney;
+  };
+}
+
+interface AzureCreditLot {
+  properties?: {
+    closedBalance?: AzureMoney;
+    originalAmount?: AzureMoney;
+    source?: string;
+    status?: string;
+  };
+}
+
+interface AzureLegacyBalance {
+  properties?: {
+    beginningBalance?: number;
+    endingBalance?: number;
+    totalUsage?: number;
+    utilized?: number;
+    currency?: string;
+  };
+}
+
+interface AzureBillingProfile {
+  name?: string;
+  displayName?: string;
+  properties?: {
+    displayName?: string;
+    currency?: string;
+    hasReadAccess?: boolean;
+  };
+}
+
+interface AzureBillingAccount {
+  name?: string;
+  displayName?: string;
+  properties?: {
+    displayName?: string;
+    billingProfiles?: AzureBillingProfile[];
   };
 }
 
@@ -257,6 +314,37 @@ function mapLocation(raw: AzureLocation): RegionInfo {
     regionType: raw.metadata?.regionType,
     geographyGroup: raw.metadata?.geographyGroup,
   };
+}
+
+function azureMoneyAmount(value?: AzureMoney): number | undefined {
+  return value?.amount ?? value?.value;
+}
+
+function azureMoneyCurrency(
+  value?: AzureMoney,
+  fallback?: string,
+): string | undefined {
+  return value?.currency?.trim() || fallback?.trim() || undefined;
+}
+
+function creditLine(
+  name: string,
+  amount: number | undefined,
+  currency?: string,
+): CreditLines {
+  if (amount === undefined) return [];
+  return [{ name, amount, currency: currency?.trim() || undefined }];
+}
+
+function errorSummary(error: unknown): string {
+  if (error instanceof ProviderError && error.status === 403) {
+    return `权限不足：${error.message}`;
+  }
+  return error instanceof Error ? error.message : String(error);
+}
+
+function dedupeStrings(values: string[]): string[] {
+  return [...new Set(values.filter((value) => value.trim().length > 0))];
 }
 
 function resourceGroupFromId(id: string | undefined): string | undefined {
@@ -764,61 +852,217 @@ export class AzureAdapter implements ProviderAdapter {
   private async tryCreditBalance(
     warnings: string[],
   ): Promise<{ currency?: string; lines?: SubscriptionBalance["credit"] }> {
+    const errors: string[] = [];
+    let accounts: AzureBillingAccount[] = [];
     try {
-      const accounts = await this.requestUrl<
-        { value?: { name?: string; displayName?: string }[] }
-      >(
+      const response = await this.requestUrl<{ value?: AzureBillingAccount[] }>(
         "GET",
-        `${BASE}/providers/Microsoft.Billing/billingAccounts?api-version=${BILLING_API}`,
+        `${BASE}/providers/Microsoft.Billing/billingAccounts?api-version=${BILLING_ACCOUNT_EXPAND_API}&$expand=billingProfiles`,
       );
-      const lines: SubscriptionBalance["credit"] = [];
-      let currency: string | undefined;
-      for (const account of accounts.value ?? []) {
-        if (!account.name) continue;
-        const profiles = await this.requestUrl<
-          { value?: { name?: string; displayName?: string }[] }
-        >(
-          "GET",
-          `${BASE}/providers/Microsoft.Billing/billingAccounts/${
-            encodeURIComponent(account.name)
-          }/billingProfiles?api-version=${BILLING_API}`,
+      accounts = response.value ?? [];
+    } catch (error) {
+      errors.push(`账单账户列表：${errorSummary(error)}`);
+    }
+
+    const lines: CreditLines = [];
+    let currency: string | undefined;
+    for (const account of accounts) {
+      if (!account.name) continue;
+      const accountLabel = account.properties?.displayName ??
+        account.displayName ?? account.name;
+
+      const legacy = await this.tryLegacyBillingBalance(account, errors);
+      for (const line of legacy.lines ?? []) {
+        currency ??= line.currency;
+        lines.push(line);
+      }
+
+      const profiles = await this.billingProfilesForAccount(account, errors);
+      for (const profile of profiles) {
+        if (!profile.name) continue;
+        const profileLabel = profile.properties?.displayName ??
+          profile.displayName ?? profile.name;
+        const lotLines = await this.tryCreditLots(
+          account.name,
+          profile.name,
+          `${profileLabel} 可用余额`,
+          errors,
         );
-        for (const profile of profiles.value ?? []) {
-          if (!profile.name) continue;
-          const summary = await this.requestUrl<AzureCreditSummary>(
-            "GET",
-            `${BASE}/providers/Microsoft.Billing/billingAccounts/${
-              encodeURIComponent(account.name)
-            }/billingProfiles/${
-              encodeURIComponent(profile.name)
-            }/providers/Microsoft.Consumption/credits/balanceSummary?api-version=${CONSUMPTION_API}`,
+        const summaryLines = lotLines.length > 0 ? [] : await this
+          .tryCreditSummary(
+            account.name,
+            profile.name,
+            profileLabel,
+            profile.properties?.currency,
+            errors,
           );
-          const balance = summary.balanceSummary;
-          for (
-            const [name, amount] of [
-              ["可用余额", balance?.availableBalance],
-              ["当前余额", balance?.currentBalance],
-              ["预估余额", balance?.estimatedBalance],
-            ] as const
-          ) {
-            if (amount?.amount === undefined) continue;
-            currency ??= amount.currency;
-            lines.push({
-              name: `${profile.displayName ?? profile.name} ${name}`,
-              amount: amount.amount,
-              currency: amount.currency,
-            });
-          }
+        const collected = lotLines.length > 0 ? lotLines : summaryLines;
+        for (const line of collected) {
+          currency ??= line.currency;
+          lines.push(line);
         }
       }
-      return { currency, lines: lines.length > 0 ? lines : undefined };
-    } catch (error) {
+      if ((legacy.lines?.length ?? 0) === 0 && profiles.length === 0) {
+        errors.push(`${accountLabel}：没有可读取的 billing profile 或余额`);
+      }
+    }
+
+    if (lines.length === 0) {
+      const detail = dedupeStrings(errors).slice(0, 2).join("；");
       warnings.push(
-        `无法读取 Billing 信用余额：${
-          error instanceof Error ? error.message : String(error)
+        detail
+          ? `无法读取 Azure 信用余额：${detail}`
+          : "无法读取 Azure 信用余额：当前订阅没有暴露可读取的账单余额接口。",
+      );
+    }
+    return { currency, lines: lines.length > 0 ? lines : undefined };
+  }
+
+  private async billingProfilesForAccount(
+    account: AzureBillingAccount,
+    errors: string[],
+  ): Promise<AzureBillingProfile[]> {
+    const expanded = account.properties?.billingProfiles ?? [];
+    if (expanded.length > 0 || !account.name) return expanded;
+    try {
+      const profiles = await this.requestUrl<
+        { value?: AzureBillingProfile[] }
+      >(
+        "GET",
+        `${BASE}/providers/Microsoft.Billing/billingAccounts/${
+          encodeURIComponent(account.name)
+        }/billingProfiles?api-version=${BILLING_API}`,
+      );
+      return profiles.value ?? [];
+    } catch (error) {
+      errors.push(
+        `${account.displayName ?? account.name} billing profiles：${
+          errorSummary(error)
+        }`,
+      );
+      return [];
+    }
+  }
+
+  private async tryLegacyBillingBalance(
+    account: AzureBillingAccount,
+    errors: string[],
+  ): Promise<{ lines?: CreditLines }> {
+    if (!account.name) return {};
+    try {
+      const balance = await this.requestUrl<AzureLegacyBalance>(
+        "GET",
+        `${BASE}/providers/Microsoft.Billing/billingAccounts/${
+          encodeURIComponent(account.name)
+        }/providers/Microsoft.Consumption/balances?api-version=${CONSUMPTION_API}`,
+      );
+      const props = balance.properties;
+      const accountLabel = account.properties?.displayName ??
+        account.displayName ?? account.name;
+      const lines: CreditLines = [
+        ...creditLine(
+          `${accountLabel} 可用余额`,
+          props?.endingBalance,
+          props?.currency,
+        ),
+        ...creditLine(
+          `${accountLabel} 本期已使用`,
+          props?.utilized ?? props?.totalUsage,
+          props?.currency,
+        ),
+        ...creditLine(
+          `${accountLabel} 期初余额`,
+          props?.beginningBalance,
+          props?.currency,
+        ),
+      ];
+      return { lines: lines.length > 0 ? lines : undefined };
+    } catch (error) {
+      errors.push(
+        `${account.displayName ?? account.name} legacy balance：${
+          errorSummary(error)
         }`,
       );
       return {};
+    }
+  }
+
+  private async tryCreditLots(
+    accountName: string,
+    profileName: string,
+    label: string,
+    errors: string[],
+  ): Promise<CreditLines> {
+    try {
+      const lots = await this.requestUrl<{ value?: AzureCreditLot[] }>(
+        "GET",
+        `${BASE}/providers/Microsoft.Billing/billingAccounts/${
+          encodeURIComponent(accountName)
+        }/billingProfiles/${
+          encodeURIComponent(profileName)
+        }/providers/Microsoft.Consumption/lots?api-version=${CONSUMPTION_CREDITS_API}`,
+      );
+      const totals = new Map<string, number>();
+      for (const lot of lots.value ?? []) {
+        const amount = azureMoneyAmount(lot.properties?.closedBalance);
+        if (amount === undefined) continue;
+        const currency = azureMoneyCurrency(lot.properties?.closedBalance) ??
+          "UNKNOWN";
+        totals.set(currency, (totals.get(currency) ?? 0) + amount);
+      }
+      return [...totals.entries()]
+        .filter(([, amount]) => amount !== 0)
+        .map(([currency, amount]) => ({
+          name: label,
+          amount,
+          currency: currency === "UNKNOWN" ? undefined : currency,
+        }));
+    } catch (error) {
+      errors.push(`${profileName} credit lots：${errorSummary(error)}`);
+      return [];
+    }
+  }
+
+  private async tryCreditSummary(
+    accountName: string,
+    profileName: string,
+    profileLabel: string,
+    fallbackCurrency: string | undefined,
+    errors: string[],
+  ): Promise<CreditLines> {
+    try {
+      const summary = await this.requestUrl<AzureCreditSummary>(
+        "GET",
+        `${BASE}/providers/Microsoft.Billing/billingAccounts/${
+          encodeURIComponent(accountName)
+        }/billingProfiles/${
+          encodeURIComponent(profileName)
+        }/providers/Microsoft.Consumption/credits/balanceSummary?api-version=${CONSUMPTION_API}`,
+      );
+      const balance = summary.properties?.balanceSummary ??
+        summary.balanceSummary;
+      const currency = summary.properties?.creditCurrency ??
+        summary.properties?.billingCurrency ?? fallbackCurrency;
+      const lines: CreditLines = [];
+      for (
+        const [name, amount] of [
+          ["可用余额", balance?.availableBalance],
+          ["当前余额", balance?.currentBalance],
+          ["预估余额", balance?.estimatedBalance],
+        ] as const
+      ) {
+        const value = azureMoneyAmount(amount);
+        if (value === undefined) continue;
+        lines.push({
+          name: `${profileLabel} ${name}`,
+          amount: value,
+          currency: azureMoneyCurrency(amount, currency),
+        });
+      }
+      return lines;
+    } catch (error) {
+      errors.push(`${profileName} credit summary：${errorSummary(error)}`);
+      return [];
     }
   }
 
@@ -839,12 +1083,12 @@ export class AzureAdapter implements ProviderAdapter {
         `/subscriptions/${sub}/providers/Microsoft.CostManagement/query`,
         COST_MANAGEMENT_API,
         {
-          type: "ActualCost",
+          type: "Usage",
           timeframe: "MonthToDate",
           dataset: {
             granularity: "None",
             aggregation: {
-              totalCost: { name: "Cost", function: "Sum" },
+              totalCost: { name: "PreTaxCost", function: "Sum" },
             },
           },
         },
@@ -865,10 +1109,13 @@ export class AzureAdapter implements ProviderAdapter {
         : undefined;
       return { amount, currency };
     } catch (error) {
+      const message = error instanceof ProviderError && error.status === 403
+        ? `当前服务主体没有 Cost Management Query 权限；请在订阅或账单范围授予 Cost Management Reader 后重试。原始错误：${error.message}`
+        : error instanceof Error
+        ? error.message
+        : String(error);
       warnings.push(
-        `无法读取本月成本：${
-          error instanceof Error ? error.message : String(error)
-        }`,
+        `无法读取本月成本：${message}`,
       );
       return {};
     }

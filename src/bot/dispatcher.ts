@@ -111,6 +111,10 @@ const CREDENTIAL_HINTS: Record<ProviderId, string> = {
     '  "tenant": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"',
     "}</code>",
     "订阅 ID 会自动识别（取该主体可访问的第一个订阅）。",
+    "",
+    "如需查询余额/成本，再额外给服务主体授予成本读取权限：",
+    '<code>az role assignment create --assignee &lt;appId&gt; --role "Cost Management Reader" \\',
+    "  --scope /subscriptions/$(az account show --query id -o tsv)</code>",
   ].join("\n"),
   gcp: [
     "🔑 <b>获取 Google Cloud 凭证（服务账号密钥）</b>",

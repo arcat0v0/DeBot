@@ -292,7 +292,190 @@ Deno.test("AzureAdapter reports subscription info, cost and student SKU regions"
   const balance = await adapter.getSubscriptionBalance();
   assertEquals(balance.monthToDateCost, 1.23);
   assertEquals(balance.currency, "USD");
-  assert(balance.warnings?.some((warning) => warning.includes("Billing")));
+  assert(
+    balance.warnings?.some((warning) =>
+      warning.includes("无法读取 Azure 信用余额")
+    ),
+  );
+});
+
+Deno.test("AzureAdapter reads legacy credit balance when cost query is denied", async () => {
+  const fetchImpl: typeof fetch = (async (input, init) => {
+    await Promise.resolve();
+    const url = new URL(String(input));
+    if (url.hostname === "login.microsoftonline.com") {
+      return Response.json({ access_token: "token", expires_in: 3600 });
+    }
+    const method = init?.method ?? "GET";
+
+    if (
+      method === "GET" &&
+      url.pathname === "/providers/Microsoft.Billing/billingAccounts"
+    ) {
+      return Response.json({
+        value: [
+          { name: "legacy-account", properties: { displayName: "Student" } },
+        ],
+      });
+    }
+    if (
+      method === "GET" &&
+      url.pathname ===
+        "/providers/Microsoft.Billing/billingAccounts/legacy-account/providers/Microsoft.Consumption/balances"
+    ) {
+      return Response.json({
+        properties: {
+          endingBalance: 88,
+          utilized: 12,
+          beginningBalance: 100,
+          currency: "USD",
+        },
+      });
+    }
+    if (
+      method === "GET" &&
+      url.pathname ===
+        "/providers/Microsoft.Billing/billingAccounts/legacy-account/billingProfiles"
+    ) {
+      return Response.json({ value: [] });
+    }
+    if (
+      method === "POST" &&
+      url.pathname ===
+        `/subscriptions/${SUB}/providers/Microsoft.CostManagement/query`
+    ) {
+      return Response.json({
+        error: { message: "The client does not have authorization" },
+      }, { status: 403 });
+    }
+    return Response.json({ error: { message: `${method} ${url.pathname}` } }, {
+      status: 404,
+    });
+  }) as typeof fetch;
+
+  const adapter = new AzureAdapter({
+    credentials: {
+      tenantId: "tenant",
+      clientId: "client",
+      clientSecret: "secret",
+      subscriptionId: SUB,
+    },
+    fetch: fetchImpl,
+  });
+
+  const balance = await adapter.getSubscriptionBalance();
+  assertEquals(balance.credit?.[0], {
+    name: "Student 可用余额",
+    amount: 88,
+    currency: "USD",
+  });
+  assert(
+    balance.warnings?.some((warning) =>
+      warning.includes("Cost Management Reader")
+    ),
+  );
+  assert(
+    !balance.warnings?.some((warning) =>
+      warning.includes("无法读取 Azure 信用余额")
+    ),
+  );
+});
+
+Deno.test("AzureAdapter parses credit summary properties shape", async () => {
+  const fetchImpl: typeof fetch = (async (input, init) => {
+    await Promise.resolve();
+    const url = new URL(String(input));
+    if (url.hostname === "login.microsoftonline.com") {
+      return Response.json({ access_token: "token", expires_in: 3600 });
+    }
+    const method = init?.method ?? "GET";
+
+    if (
+      method === "GET" &&
+      url.pathname === "/providers/Microsoft.Billing/billingAccounts"
+    ) {
+      return Response.json({
+        value: [
+          {
+            name: "acct",
+            properties: {
+              displayName: "Billing",
+              billingProfiles: [
+                {
+                  name: "profile",
+                  properties: { displayName: "Credits", currency: "USD" },
+                },
+              ],
+            },
+          },
+        ],
+      });
+    }
+    if (
+      method === "GET" &&
+      url.pathname ===
+        "/providers/Microsoft.Billing/billingAccounts/acct/providers/Microsoft.Consumption/balances"
+    ) {
+      return Response.json({ error: { message: "unsupported" } }, {
+        status: 404,
+      });
+    }
+    if (
+      method === "GET" &&
+      url.pathname ===
+        "/providers/Microsoft.Billing/billingAccounts/acct/billingProfiles/profile/providers/Microsoft.Consumption/lots"
+    ) {
+      return Response.json({ value: [] });
+    }
+    if (
+      method === "GET" &&
+      url.pathname ===
+        "/providers/Microsoft.Billing/billingAccounts/acct/billingProfiles/profile/providers/Microsoft.Consumption/credits/balanceSummary"
+    ) {
+      return Response.json({
+        properties: {
+          creditCurrency: "USD",
+          balanceSummary: {
+            currentBalance: { value: 42, currency: "USD" },
+            estimatedBalance: { value: 41.5, currency: "USD" },
+          },
+        },
+      });
+    }
+    if (
+      method === "POST" &&
+      url.pathname ===
+        `/subscriptions/${SUB}/providers/Microsoft.CostManagement/query`
+    ) {
+      return Response.json({
+        properties: {
+          columns: [{ name: "PreTaxCost" }, { name: "Currency" }],
+          rows: [[1.25, "USD"]],
+        },
+      });
+    }
+    return Response.json({ error: { message: `${method} ${url.pathname}` } }, {
+      status: 404,
+    });
+  }) as typeof fetch;
+
+  const adapter = new AzureAdapter({
+    credentials: {
+      tenantId: "tenant",
+      clientId: "client",
+      clientSecret: "secret",
+      subscriptionId: SUB,
+    },
+    fetch: fetchImpl,
+  });
+
+  const balance = await adapter.getSubscriptionBalance();
+  assertEquals(balance.credit?.map((item) => item.name), [
+    "Credits 当前余额",
+    "Credits 预估余额",
+  ]);
+  assertEquals(balance.credit?.[0].amount, 42);
+  assertEquals(balance.monthToDateCost, 1.25);
 });
 
 Deno.test("AzureAdapter deletes VM dependencies created with the instance", async () => {
