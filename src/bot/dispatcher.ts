@@ -1,11 +1,15 @@
 import type { Logger } from "../app/logger.ts";
-import { toUserMessage } from "../shared/errors.ts";
+import { toUserMessage, ValidationError } from "../shared/errors.ts";
 import { PROVIDER_IDS, PROVIDER_LABELS } from "../cloud/types.ts";
 import type {
+  CreateInstanceInput,
   FirewallProtocol,
   FirewallRuleInput,
   Instance,
   ProviderId,
+  RegionAvailability,
+  SubscriptionBalance,
+  SubscriptionInfo,
 } from "../cloud/types.ts";
 import type { CloudService } from "../cloud/service.ts";
 import { providerServices } from "../cloud/registry.ts";
@@ -76,6 +80,9 @@ const VERB_LABELS: Record<string, string> = {
   stop: "已请求停止",
   reboot: "已请求重启",
 };
+
+const AZURE_CUSTOM_CREATE_FORMAT =
+  "名称 | 区域 | 资源组 | 镜像 | 规格 | SSH公钥 | IPv6";
 
 const CREDENTIAL_HINTS: Record<ProviderId, string> = {
   aws: [
@@ -212,6 +219,121 @@ function parseFirewallRuleInput(text: string): FirewallRuleInput {
     source,
     description: "Created by DeBot",
   };
+}
+
+function cleanField(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed || trimmed === "-") return undefined;
+  return trimmed;
+}
+
+function parseBooleanField(value: string | undefined): boolean {
+  const trimmed = value?.trim().toLowerCase();
+  return trimmed === "1" || trimmed === "yes" || trimmed === "y" ||
+    trimmed === "true" || trimmed === "on" || trimmed === "开" ||
+    trimmed === "开启" || trimmed === "是";
+}
+
+function parseAzureCustomCreateInput(
+  text: string,
+  fallbackRegion?: string,
+): CreateInstanceInput {
+  const parts = text.split("|").map((part) => part.trim());
+  const image = cleanField(parts[3]);
+  const size = cleanField(parts[4]);
+  const sshKey = cleanField(parts[5]);
+  if (!image || !size || !sshKey) {
+    throw new ValidationError(
+      `请按以下格式发送：${AZURE_CUSTOM_CREATE_FORMAT}`,
+    );
+  }
+  const region = cleanField(parts[1]) ?? fallbackRegion;
+  if (!region) {
+    throw new ValidationError("Azure 手动创建需要填写区域。");
+  }
+  return {
+    name: cleanField(parts[0]),
+    region,
+    resourceGroup: cleanField(parts[2]),
+    image,
+    size,
+    sshKeyId: sshKey,
+    enableIpv6: parseBooleanField(parts[6]),
+  };
+}
+
+function formatAmount(amount: number | undefined, currency?: string): string {
+  if (amount === undefined) return "未知";
+  const value = Number.isInteger(amount) ? String(amount) : amount.toFixed(4);
+  return currency ? `${value} ${currency}` : value;
+}
+
+function subscriptionInfoText(info: SubscriptionInfo): string {
+  const lines = [bold("Azure 订阅类型")];
+  lines.push(`订阅 ID：${code(info.id)}`);
+  if (info.displayName) lines.push(`名称：${code(info.displayName)}`);
+  if (info.state) lines.push(`状态：${code(info.state)}`);
+  if (info.quotaId) lines.push(`Quota：${code(info.quotaId)}`);
+  if (info.spendingLimit) {
+    lines.push(`消费限制：${code(info.spendingLimit)}`);
+  }
+  lines.push(`学生订阅：${info.isStudent ? "是" : "未识别"}`);
+  if (info.studentReason) lines.push(`依据：${escapeHtml(info.studentReason)}`);
+  return lines.join("\n");
+}
+
+function subscriptionBalanceText(balance: SubscriptionBalance): string {
+  const lines = [bold("Azure 订阅余额")];
+  lines.push(`订阅 ID：${code(balance.subscriptionId)}`);
+  if (balance.credit?.length) {
+    lines.push("");
+    lines.push("信用余额：");
+    for (const item of balance.credit) {
+      lines.push(
+        `• ${escapeHtml(item.name)}：${
+          escapeHtml(formatAmount(item.amount, item.currency))
+        }`,
+      );
+    }
+  }
+  if (balance.monthToDateCost !== undefined) {
+    lines.push(
+      `本月已产生成本：${
+        escapeHtml(formatAmount(balance.monthToDateCost, balance.currency))
+      }`,
+    );
+  }
+  if (!balance.credit?.length && balance.monthToDateCost === undefined) {
+    lines.push("", "未能读取余额或本月成本。");
+  }
+  if (balance.warnings?.length) {
+    lines.push("", "提示：");
+    for (const warning of balance.warnings.slice(0, 3)) {
+      lines.push(`• ${escapeHtml(warning)}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function regionAvailabilityText(items: RegionAvailability[]): string {
+  const available = items.filter((item) => item.availableSizes.length > 0);
+  const lines = [bold("Azure 免费规格区域")];
+  lines.push(`可用区域：${available.length}/${items.length}`);
+  lines.push("");
+  if (available.length === 0) {
+    lines.push("未找到可用的学生免费规格。");
+  } else {
+    for (const item of available.slice(0, 40)) {
+      lines.push(
+        `• ${escapeHtml(item.displayName ?? item.region)} ${
+          code(item.region)
+        }：${escapeHtml(item.availableSizes.join(", "))}`,
+      );
+    }
+  }
+  lines.push("");
+  lines.push("检测规格：Standard_B1s, Standard_B2ats_v2, Standard_B2pts_v2");
+  return lines.join("\n");
 }
 
 export class Dispatcher {
@@ -425,6 +547,9 @@ export class Dispatcher {
       case "fw":
         await this.handleFirewallCallback(user, surface, parts, ack);
         return;
+      case "az":
+        await this.handleAzureCallback(user, surface, parts, ack);
+        return;
       case "cr":
         await this.showCreateMenu(
           surface,
@@ -476,6 +601,125 @@ export class Dispatcher {
       `${bold("DeBot")}\n自托管的多云运维助手。\n\n请选择云服务商：`,
       keyboard(rows),
     );
+  }
+
+  private async handleAzureCallback(
+    user: TgUser,
+    surface: Surface,
+    parts: string[],
+    ack: (text?: string, alert?: boolean) => Promise<void>,
+  ): Promise<void> {
+    const provider = decodeProvider(parts[1]);
+    const service = decodeService(parts[2]);
+    if (provider !== "azure") throw new Error("该操作仅支持 Azure");
+    const action = parts[3];
+    const pc = providerCode(provider);
+    const sc = serviceCode(service);
+    const profile = await this.deps.profiles.getActive(provider);
+    const region = this.regionFor(surface, provider, profile?.defaultRegion);
+    const adapter = await this.deps.cloud.getAdapter(provider, {
+      service,
+      region,
+    });
+
+    if (action === "sub") {
+      if (!adapter.getSubscriptionInfo) {
+        throw new Error("该服务商不支持查询订阅类型");
+      }
+      const info = await adapter.getSubscriptionInfo();
+      await this.showMenu(
+        surface,
+        subscriptionInfoText(info),
+        keyboard([
+          [button("🔄 刷新", `az:${pc}:${sc}:sub`)],
+          [button("⬅️ 返回", `svc:${pc}:${sc}`)],
+        ]),
+      );
+      return;
+    }
+
+    if (action === "bal") {
+      if (!adapter.getSubscriptionBalance) {
+        throw new Error("该服务商不支持查询订阅余额");
+      }
+      const balance = await adapter.getSubscriptionBalance();
+      await this.showMenu(
+        surface,
+        subscriptionBalanceText(balance),
+        keyboard([
+          [button("🔄 刷新", `az:${pc}:${sc}:bal`)],
+          [button("⬅️ 返回", `svc:${pc}:${sc}`)],
+        ]),
+      );
+      return;
+    }
+
+    if (action === "avail") {
+      if (!adapter.listRegionAvailability) {
+        throw new Error("该服务商不支持查询规格区域可用性");
+      }
+      const availability = await adapter.listRegionAvailability();
+      await this.showMenu(
+        surface,
+        regionAvailabilityText(availability),
+        keyboard([
+          [button("🔄 刷新", `az:${pc}:${sc}:avail`)],
+          [button("⬅️ 返回", `svc:${pc}:${sc}`)],
+        ]),
+      );
+      return;
+    }
+
+    if (action === "student") {
+      this.deps.sessions.setFlow(user.id, {
+        kind: "azure_student_create",
+        service,
+        region,
+        enableIpv6: parts[4] === "1",
+        chatId: surface.chatId,
+        messageId: surface.messageId,
+      });
+      await ack();
+      await this.deps.api.sendMessage({
+        chat_id: surface.chatId,
+        text: [
+          "请发送要写入 Azure VM 的 SSH 公钥。",
+          "",
+          "默认会自动选择当前区域内可用的学生免费规格，当前未设置区域时会从可用区域中选择第一个。",
+          "管理员用户名固定为 azureuser，资源组会按凭证配置、唯一可访问资源组或 debot 自动选择。",
+        ].join("\n"),
+      });
+      return;
+    }
+
+    if (action === "custom") {
+      this.deps.sessions.setFlow(user.id, {
+        kind: "azure_custom_create",
+        service,
+        region,
+        chatId: surface.chatId,
+        messageId: surface.messageId,
+      });
+      await ack();
+      await this.deps.api.sendMessage({
+        chat_id: surface.chatId,
+        text: [
+          "请发送 Azure VM 创建参数：",
+          code(AZURE_CUSTOM_CREATE_FORMAT),
+          "",
+          "示例：",
+          code(
+            "myvm | eastasia | debot | Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest | Standard_B1s | ssh-rsa AAAA... user@host | no",
+          ),
+          "",
+          "名称和资源组可填 -；IPv6 填 yes/no。",
+        ].join("\n"),
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    await this.showService(surface, provider, service);
   }
 
   private async showHelp(surface: Surface): Promise<void> {
@@ -557,6 +801,15 @@ export class Dispatcher {
 
     const rows = [[button("📋 实例列表", `ls:${pc}:${sc}`)]];
     if (caps.create) rows.push([button("➕ 用预设创建", `cr:${pc}:${sc}`)]);
+    const infoRow = [];
+    if (caps.subscriptionInfo) {
+      infoRow.push(button("🎓 订阅类型", `az:${pc}:${sc}:sub`));
+    }
+    if (caps.balance) infoRow.push(button("💰 订阅余额", `az:${pc}:${sc}:bal`));
+    if (infoRow.length > 0) rows.push(infoRow);
+    if (caps.regionAvailability) {
+      rows.push([button("🗺 免费规格区域", `az:${pc}:${sc}:avail`)]);
+    }
     if (caps.regions) {
       rows.push([button(`🌐 区域：${region ?? "默认"}`, `rg:${pc}:${sc}`)]);
     }
@@ -1196,27 +1449,34 @@ export class Dispatcher {
     const presets = await this.deps.presets.listByProvider(provider);
     const pc = providerCode(provider);
     const sc = serviceCode(service);
-    if (presets.length === 0) {
-      await this.showMenu(
-        surface,
-        `${bold("用预设创建")}\n\n还没有 ${
-          PROVIDER_LABELS[provider]
-        } 预设，请用 /presets 添加。`,
-        keyboard([
-          [button("📦 管理预设", "pst:home")],
-          [button("⬅️ 返回", `svc:${pc}:${sc}`)],
-        ]),
-      );
-      return;
+    const rows = [];
+    const lines = [bold("创建实例")];
+    if (provider === "azure") {
+      lines.push("", "Azure 可直接使用学生免费默认配置，也可以手动填写参数。");
+      rows.push([
+        button("🎓 学生默认 IPv4", `az:${pc}:${sc}:student:0`),
+      ]);
+      rows.push([
+        button("🎓 学生默认 IPv4+IPv6", `az:${pc}:${sc}:student:1`),
+      ]);
+      rows.push([button("✍️ 手动填写创建", `az:${pc}:${sc}:custom`)]);
     }
-    const rows = presets.map((preset) => [
-      button(
-        `📦 ${preset.name}（${preset.size}）`,
-        `mk:${pc}:${sc}:${preset.id}`,
-      ),
-    ]);
+    if (presets.length === 0) {
+      lines.push("", `还没有 ${PROVIDER_LABELS[provider]} 预设。`);
+    } else {
+      lines.push("", "保存的预设：");
+      for (const preset of presets) {
+        rows.push([
+          button(
+            `📦 ${preset.name}（${preset.size}）`,
+            `mk:${pc}:${sc}:${preset.id}`,
+          ),
+        ]);
+      }
+    }
+    rows.push([button("📦 管理预设", "pst:home")]);
     rows.push([button("⬅️ 返回", `svc:${pc}:${sc}`)]);
-    await this.showMenu(surface, `${bold("选择要创建的预设")}`, keyboard(rows));
+    await this.showMenu(surface, lines.join("\n"), keyboard(rows));
   }
 
   private async createFromPreset(
@@ -1488,6 +1748,120 @@ export class Dispatcher {
         parse_mode: "HTML",
       });
       await this.showPresets(surface);
+      return;
+    }
+
+    if (flow.kind === "azure_student_create") {
+      const sshKey = text.trim();
+      if (sshKey.length === 0) {
+        await this.deps.api.sendMessage({
+          chat_id: surface.chatId,
+          text: "请发送 SSH 公钥。",
+        });
+        return;
+      }
+      this.deps.sessions.clearFlow(user.id);
+      const label = flow.enableIpv6
+        ? "创建 Azure 学生默认 VM（IPv6）"
+        : "创建 Azure 学生默认 VM";
+      const job = this.deps.jobs.enqueue({
+        kind: "create",
+        label,
+        provider: "azure",
+        userId: user.id,
+        run: async () => {
+          const adapter = await this.deps.cloud.getAdapter("azure", {
+            service: flow.service,
+            region: flow.region,
+          });
+          if (!adapter.selectDefaultCreateOption) {
+            throw new Error("该服务商不支持默认创建选项");
+          }
+          const option = await adapter.selectDefaultCreateOption(flow.region);
+          const instance = await adapter.createInstance({
+            name: `debot-student-${Date.now()}`,
+            region: option.region,
+            resourceGroup: option.resourceGroup,
+            image: option.image,
+            size: option.size,
+            sshKeyId: sshKey,
+            enableIpv6: flow.enableIpv6,
+            osDiskSizeGb: option.osDiskSizeGb,
+            osDiskStorageAccountType: option.osDiskStorageAccountType,
+            tags: { createdBy: "DeBot", preset: "azure-student-free" },
+          });
+          return `已创建 ${instance.name}（${instance.id}），区域 ${option.region}，规格 ${option.size}`;
+        },
+        onUpdate: (record) =>
+          this.editJobMessage(
+            { chatId: flow.chatId, messageId: flow.messageId },
+            "azure",
+            flow.service,
+            label,
+            record,
+          ),
+      });
+      await this.deps.api.sendMessage({
+        chat_id: surface.chatId,
+        text: "创建任务已加入队列。",
+      });
+      this.editJobMessage(
+        { chatId: flow.chatId, messageId: flow.messageId },
+        "azure",
+        flow.service,
+        label,
+        job,
+      );
+      return;
+    }
+
+    if (flow.kind === "azure_custom_create") {
+      let input: CreateInstanceInput;
+      try {
+        input = parseAzureCustomCreateInput(text, flow.region);
+      } catch (error) {
+        await this.deps.api.sendMessage({
+          chat_id: surface.chatId,
+          text: `创建参数不正确：${escapeHtml(toUserMessage(error))}`,
+          parse_mode: "HTML",
+        });
+        return;
+      }
+      this.deps.sessions.clearFlow(user.id);
+      const label = `创建 Azure VM ${input.name ?? input.size}`;
+      const job = this.deps.jobs.enqueue({
+        kind: "create",
+        label,
+        provider: "azure",
+        userId: user.id,
+        run: async () => {
+          const adapter = await this.deps.cloud.getAdapter("azure", {
+            service: flow.service,
+            region: input.region,
+          });
+          const instance = await adapter.createInstance(input);
+          return `已创建 ${instance.name}（${instance.id}）`;
+        },
+        onUpdate: (record) =>
+          this.editJobMessage(
+            { chatId: flow.chatId, messageId: flow.messageId },
+            "azure",
+            flow.service,
+            label,
+            record,
+          ),
+      });
+      await this.deps.api.sendMessage({
+        chat_id: surface.chatId,
+        text: "创建任务已加入队列。",
+      });
+      this.editJobMessage(
+        { chatId: flow.chatId, messageId: flow.messageId },
+        "azure",
+        flow.service,
+        label,
+        job,
+      );
       return;
     }
 

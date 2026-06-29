@@ -57,6 +57,7 @@ export interface InstanceList {
 
 export interface CreateInstanceInput {
   name?: string;
+  resourceGroup?: string;
   region?: string;
   zone?: string;
   image: string;
@@ -64,6 +65,9 @@ export interface CreateInstanceInput {
   sshKeyId?: string;
   tags?: Record<string, string>;
   userData?: string;
+  enableIpv6?: boolean;
+  osDiskSizeGb?: number;
+  osDiskStorageAccountType?: string;
 }
 
 export type FirewallProtocol = "Tcp" | "Udp" | "Icmp" | "*";
@@ -99,8 +103,63 @@ export interface Capabilities {
   delete: boolean;
   rename: boolean;
   regions: boolean;
+  regionAvailability: boolean;
+  balance: boolean;
+  subscriptionInfo: boolean;
   ipv6: boolean;
   firewall: boolean;
+  customCreate: boolean;
+}
+
+export interface SubscriptionInfo {
+  id: string;
+  displayName?: string;
+  state?: string;
+  tenantId?: string;
+  quotaId?: string;
+  spendingLimit?: string;
+  authorizationSource?: string;
+  isStudent?: boolean;
+  studentReason?: string;
+}
+
+export interface SubscriptionBalanceLine {
+  name: string;
+  amount?: number;
+  currency?: string;
+}
+
+export interface SubscriptionBalance {
+  subscriptionId: string;
+  currency?: string;
+  credit?: SubscriptionBalanceLine[];
+  monthToDateCost?: number;
+  warnings?: string[];
+}
+
+export interface RegionInfo {
+  name: string;
+  displayName?: string;
+  regionalDisplayName?: string;
+  regionCategory?: string;
+  regionType?: string;
+  geographyGroup?: string;
+}
+
+export interface RegionAvailability {
+  region: string;
+  displayName?: string;
+  availableSizes: string[];
+  restrictedSizes: string[];
+}
+
+export interface DefaultCreateOption {
+  region: string;
+  size: string;
+  image: string;
+  resourceGroup?: string;
+  osDiskSizeGb?: number;
+  osDiskStorageAccountType?: string;
 }
 
 export interface ProviderAdapter {
@@ -108,6 +167,13 @@ export interface ProviderAdapter {
   readonly label: string;
   capabilities(): Capabilities;
   listRegions(): Promise<string[]>;
+  listRegionInfo?(): Promise<RegionInfo[]>;
+  listRegionAvailability?(sizes?: string[]): Promise<RegionAvailability[]>;
+  getSubscriptionInfo?(): Promise<SubscriptionInfo>;
+  getSubscriptionBalance?(): Promise<SubscriptionBalance>;
+  selectDefaultCreateOption?(
+    region?: string,
+  ): Promise<DefaultCreateOption>;
   listInstances(opts?: ListOptions): Promise<InstanceList>;
   getInstance(id: string, locator?: InstanceLocator): Promise<Instance>;
   createInstance(input: CreateInstanceInput): Promise<Instance>;

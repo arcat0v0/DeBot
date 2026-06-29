@@ -10,6 +10,7 @@ import type {
   AdapterContext,
   Capabilities,
   CreateInstanceInput,
+  DefaultCreateOption,
   FirewallAccess,
   FirewallDirection,
   FirewallProtocol,
@@ -21,15 +22,109 @@ import type {
   InstanceState,
   ListOptions,
   ProviderAdapter,
+  RegionAvailability,
+  RegionInfo,
+  SubscriptionBalance,
+  SubscriptionInfo,
 } from "../../types.ts";
 import { AzureAuth } from "./auth.ts";
 
 const BASE = "https://management.azure.com";
 const COMPUTE_API = "2023-09-01";
+const DISK_API = "2023-10-02";
 const NETWORK_API = "2023-09-01";
+const SUBSCRIPTION_API = "2022-12-01";
+const RESOURCE_GROUP_API = "2022-09-01";
+const RESOURCE_SKU_API = "2023-09-01";
+const COST_MANAGEMENT_API = "2023-11-01";
+const BILLING_API = "2024-04-01";
+const CONSUMPTION_API = "2024-08-01";
+const AZURE_STUDENT_FREE_SIZES = [
+  "Standard_B1s",
+  "Standard_B2ats_v2",
+  "Standard_B2pts_v2",
+];
+const AZURE_STUDENT_REGION_PREFERENCE = [
+  "indonesiacentral",
+  "southeastasia",
+  "eastasia",
+  "japaneast",
+  "japanwest",
+  "koreacentral",
+  "centralindia",
+  "australiaeast",
+  "westus2",
+  "canadacentral",
+  "francecentral",
+  "swedencentral",
+];
+const AZURE_STUDENT_DEFAULT_RG = "debot";
+const AZURE_STUDENT_DEFAULT_IMAGE =
+  "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest";
+const AZURE_STUDENT_ARM_IMAGE =
+  "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-arm64:latest";
+const AZURE_STUDENT_OS_DISK_SIZE_GB = 64;
+const AZURE_STUDENT_OS_DISK_STORAGE = "Premium_LRS";
 
 interface AzureStatus {
   code?: string;
+}
+
+interface AzureSubscription {
+  subscriptionId?: string;
+  displayName?: string;
+  state?: string;
+  tenantId?: string;
+  authorizationSource?: string;
+  subscriptionPolicies?: {
+    locationPlacementId?: string;
+    quotaId?: string;
+    spendingLimit?: string;
+  };
+}
+
+interface AzureLocation {
+  name?: string;
+  displayName?: string;
+  regionalDisplayName?: string;
+  metadata?: {
+    regionCategory?: string;
+    regionType?: string;
+    geographyGroup?: string;
+  };
+}
+
+interface AzureSkuRestriction {
+  type?: string;
+  values?: string[];
+  reasonCode?: string;
+  restrictionInfo?: { locations?: string[]; zones?: string[] };
+}
+
+interface AzureResourceSku {
+  name?: string;
+  resourceType?: string;
+  locations?: string[];
+  locationInfo?: { location?: string; zones?: string[] }[];
+  restrictions?: AzureSkuRestriction[];
+}
+
+interface AzureResourceSkuPage {
+  value?: AzureResourceSku[];
+  nextLink?: string;
+}
+
+interface AzureCreditSummary {
+  balanceSummary?: {
+    availableBalance?: { amount?: number; currency?: string };
+    currentBalance?: { amount?: number; currency?: string };
+    estimatedBalance?: { amount?: number; currency?: string };
+  };
+}
+
+interface AzureResourceGroup {
+  name?: string;
+  location?: string;
 }
 
 interface AzureVm {
@@ -41,6 +136,7 @@ interface AzureVm {
     hardwareProfile?: { vmSize?: string };
     storageProfile?: {
       imageReference?: { publisher?: string; offer?: string; sku?: string };
+      osDisk?: { managedDisk?: { id?: string } };
     };
     instanceView?: { statuses?: AzureStatus[] };
     networkProfile?: { networkInterfaces?: { id?: string }[] };
@@ -118,6 +214,50 @@ interface AzureNetworkSecurityGroup {
 
 const IPV6_VNET_PREFIX = "ace:cab:deca::/48";
 const IPV6_SUBNET_PREFIX = "ace:cab:deca:deed::/64";
+
+function inferStudentSubscription(sub: AzureSubscription): {
+  isStudent: boolean;
+  reason?: string;
+} {
+  const haystack = [
+    sub.displayName,
+    sub.subscriptionPolicies?.quotaId,
+    sub.subscriptionPolicies?.spendingLimit,
+  ].filter(Boolean).join(" ").toLowerCase();
+  if (haystack.includes("student")) {
+    return { isStudent: true, reason: "订阅字段包含 student" };
+  }
+  if (haystack.includes("ms-azr-0170") || haystack.includes("0170p")) {
+    return { isStudent: true, reason: "订阅 offer 与 Azure for Students 匹配" };
+  }
+  return { isStudent: false };
+}
+
+function mapSubscription(raw: AzureSubscription): SubscriptionInfo {
+  const inferred = inferStudentSubscription(raw);
+  return {
+    id: raw.subscriptionId ?? "",
+    displayName: raw.displayName,
+    state: raw.state,
+    tenantId: raw.tenantId,
+    authorizationSource: raw.authorizationSource,
+    quotaId: raw.subscriptionPolicies?.quotaId,
+    spendingLimit: raw.subscriptionPolicies?.spendingLimit,
+    isStudent: inferred.isStudent,
+    studentReason: inferred.reason,
+  };
+}
+
+function mapLocation(raw: AzureLocation): RegionInfo {
+  return {
+    name: raw.name ?? "",
+    displayName: raw.displayName,
+    regionalDisplayName: raw.regionalDisplayName,
+    regionCategory: raw.metadata?.regionCategory,
+    regionType: raw.metadata?.regionType,
+    geographyGroup: raw.metadata?.geographyGroup,
+  };
+}
 
 function resourceGroupFromId(id: string | undefined): string | undefined {
   if (!id) return undefined;
@@ -235,6 +375,54 @@ function nextSecurityRulePriority(rules: AzureSecurityRule[]): number {
   });
 }
 
+function restrictionAppliesToLocation(
+  restriction: AzureSkuRestriction,
+  location: string,
+): boolean {
+  const normalized = location.toLowerCase();
+  const values = restriction.values ?? [];
+  const locations = restriction.restrictionInfo?.locations ?? [];
+  if (values.length === 0 && locations.length === 0) return true;
+  return values.some((value) => value.toLowerCase() === normalized) ||
+    locations.some((value) => value.toLowerCase() === normalized);
+}
+
+function skuAvailableInLocation(
+  sku: AzureResourceSku,
+  location: string,
+): boolean {
+  if (sku.resourceType !== "virtualMachines") return false;
+  const normalized = location.toLowerCase();
+  const locations = new Set([
+    ...(sku.locations ?? []),
+    ...((sku.locationInfo ?? []).map((item) => item.location).filter(
+      (item): item is string => Boolean(item),
+    )),
+  ].map((item) => item.toLowerCase()));
+  if (!locations.has(normalized)) return false;
+  for (const restriction of sku.restrictions ?? []) {
+    if (
+      restriction.reasonCode === "NotAvailableForSubscription" &&
+      restriction.type === "Location" &&
+      restrictionAppliesToLocation(restriction, location)
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function azureStudentImageForSize(size: string): string {
+  return size.toLowerCase().includes("pts")
+    ? AZURE_STUDENT_ARM_IMAGE
+    : AZURE_STUDENT_DEFAULT_IMAGE;
+}
+
+function regionPreferenceIndex(region: string): number {
+  const index = AZURE_STUDENT_REGION_PREFERENCE.indexOf(region.toLowerCase());
+  return index === -1 ? Number.MAX_SAFE_INTEGER : index;
+}
+
 export class AzureAdapter implements ProviderAdapter {
   readonly id = "azure" as const;
   readonly label = "Azure";
@@ -242,6 +430,7 @@ export class AzureAdapter implements ProviderAdapter {
   private subscriptionId?: string;
   private readonly resourceGroup?: string;
   private readonly fetchImpl: FetchLike;
+  private inferredResourceGroup?: string;
 
   constructor(ctx: AdapterContext<"azure">) {
     this.fetchImpl = ctx.fetch ?? fetch;
@@ -253,7 +442,7 @@ export class AzureAdapter implements ProviderAdapter {
   private async sub(): Promise<string> {
     if (this.subscriptionId) return this.subscriptionId;
     const data = await this.request<
-      { value: { subscriptionId: string; state?: string }[] }
+      { value: AzureSubscription[] }
     >("GET", "/subscriptions", "2020-01-01");
     const found = data.value.find((item) => item.state === "Enabled") ??
       data.value[0];
@@ -263,8 +452,22 @@ export class AzureAdapter implements ProviderAdapter {
           "该服务主体没有可访问的订阅，请确认已为其分配订阅范围的角色。",
       });
     }
+    if (!found.subscriptionId) {
+      throw new ProviderError("azure", "subscription id missing", {
+        userMessage: "Azure 返回的订阅缺少 subscriptionId。",
+      });
+    }
     this.subscriptionId = found.subscriptionId;
     return this.subscriptionId;
+  }
+
+  private async subscription(): Promise<AzureSubscription> {
+    const sub = await this.sub();
+    return await this.request<AzureSubscription>(
+      "GET",
+      `/subscriptions/${sub}`,
+      SUBSCRIPTION_API,
+    );
   }
 
   private async request<T>(
@@ -275,10 +478,25 @@ export class AzureAdapter implements ProviderAdapter {
   ): Promise<T> {
     const token = await this.auth.getAccessToken();
     const separator = path.includes("?") ? "&" : "?";
+    return await this.requestUrl<T>(
+      method,
+      `${BASE}${path}${separator}api-version=${apiVersion}`,
+      body,
+      token,
+    );
+  }
+
+  private async requestUrl<T>(
+    method: string,
+    url: string,
+    body?: unknown,
+    accessToken?: string,
+  ): Promise<T> {
+    const token = accessToken ?? await this.auth.getAccessToken();
     return await requestJson<T>(
       this.fetchImpl,
       "azure",
-      `${BASE}${path}${separator}api-version=${apiVersion}`,
+      url,
       {
         method,
         headers: { authorization: `Bearer ${token}` },
@@ -305,6 +523,10 @@ export class AzureAdapter implements ProviderAdapter {
   private nsgPath(sub: string, rg: string, name: string): string {
     return `/subscriptions/${sub}/resourceGroups/${rg}` +
       `/providers/Microsoft.Network/networkSecurityGroups/${name}`;
+  }
+
+  private resourceGroupPath(sub: string, rg: string): string {
+    return `/subscriptions/${sub}/resourceGroups/${rg}`;
   }
 
   private securityRulePath(nsgId: string, ruleName: string): string {
@@ -359,6 +581,54 @@ export class AzureAdapter implements ProviderAdapter {
     return nsgId;
   }
 
+  private async ensureResourceGroup(
+    sub: string,
+    rg: string,
+    location: string,
+  ): Promise<void> {
+    try {
+      await this.request(
+        "GET",
+        this.resourceGroupPath(sub, rg),
+        RESOURCE_GROUP_API,
+      );
+      return;
+    } catch (error) {
+      if (!(error instanceof ProviderError) || error.status !== 404) {
+        throw error;
+      }
+    }
+    await this.request(
+      "PUT",
+      this.resourceGroupPath(sub, rg),
+      RESOURCE_GROUP_API,
+      { location },
+    );
+  }
+
+  private async defaultResourceGroup(): Promise<string> {
+    if (this.resourceGroup) return this.resourceGroup;
+    if (this.inferredResourceGroup) return this.inferredResourceGroup;
+    try {
+      const sub = await this.sub();
+      const data = await this.request<{ value?: AzureResourceGroup[] }>(
+        "GET",
+        `/subscriptions/${sub}/resourcegroups`,
+        RESOURCE_GROUP_API,
+      );
+      const groups = (data.value ?? [])
+        .map((group) => group.name)
+        .filter((name): name is string => Boolean(name));
+      if (groups.length === 1) {
+        this.inferredResourceGroup = groups[0];
+        return groups[0];
+      }
+    } catch {
+      void 0;
+    }
+    return AZURE_STUDENT_DEFAULT_RG;
+  }
+
   capabilities(): Capabilities {
     return {
       create: true,
@@ -368,19 +638,237 @@ export class AzureAdapter implements ProviderAdapter {
       delete: true,
       rename: false,
       regions: true,
+      regionAvailability: true,
+      balance: true,
+      subscriptionInfo: true,
       ipv6: true,
       firewall: true,
+      customCreate: true,
     };
   }
 
   async listRegions(): Promise<string[]> {
+    return (await this.listRegionInfo()).map((location) => location.name);
+  }
+
+  async listRegionInfo(): Promise<RegionInfo[]> {
     const sub = await this.sub();
-    const data = await this.request<{ value: { name: string }[] }>(
+    const data = await this.request<{ value: AzureLocation[] }>(
       "GET",
       `/subscriptions/${sub}/locations`,
-      "2022-12-01",
+      SUBSCRIPTION_API,
     );
-    return data.value.map((location) => location.name);
+    return data.value.map(mapLocation).filter((location) =>
+      location.name.length > 0
+    );
+  }
+
+  private async listResourceSkus(): Promise<AzureResourceSku[]> {
+    const sub = await this.sub();
+    let url: string | undefined =
+      `${BASE}/subscriptions/${sub}/providers/Microsoft.Compute/skus?api-version=${RESOURCE_SKU_API}`;
+    const out: AzureResourceSku[] = [];
+    while (url) {
+      const page: AzureResourceSkuPage = await this.requestUrl<
+        AzureResourceSkuPage
+      >("GET", url);
+      out.push(...(page.value ?? []));
+      url = page.nextLink;
+    }
+    return out;
+  }
+
+  async listRegionAvailability(
+    sizes = AZURE_STUDENT_FREE_SIZES,
+  ): Promise<RegionAvailability[]> {
+    const [regions, skus] = await Promise.all([
+      this.listRegionInfo(),
+      this.listResourceSkus(),
+    ]);
+    const skuMap = new Map<string, AzureResourceSku[]>();
+    for (
+      const sku of skus.filter((sku) =>
+        sku.resourceType === "virtualMachines" && sku.name
+      )
+    ) {
+      const list = skuMap.get(sku.name!) ?? [];
+      list.push(sku);
+      skuMap.set(sku.name!, list);
+    }
+    return regions.map((region) => {
+      const availableSizes = sizes.filter((size) => {
+        const entries = skuMap.get(size) ?? [];
+        return entries.some((sku) => skuAvailableInLocation(sku, region.name));
+      });
+      return {
+        region: region.name,
+        displayName: region.displayName,
+        availableSizes,
+        restrictedSizes: sizes.filter((size) => !availableSizes.includes(size)),
+      };
+    });
+  }
+
+  async getSubscriptionInfo(): Promise<SubscriptionInfo> {
+    return mapSubscription(await this.subscription());
+  }
+
+  async getSubscriptionBalance(): Promise<SubscriptionBalance> {
+    const sub = await this.sub();
+    const warnings: string[] = [];
+    const credit = await this.tryCreditBalance(warnings);
+    const cost = await this.tryMonthToDateCost(sub, warnings);
+    return {
+      subscriptionId: sub,
+      currency: credit.currency ?? cost.currency,
+      credit: credit.lines,
+      monthToDateCost: cost.amount,
+      warnings,
+    };
+  }
+
+  async selectDefaultCreateOption(
+    region?: string,
+  ): Promise<DefaultCreateOption> {
+    const availability = await this.listRegionAvailability(
+      AZURE_STUDENT_FREE_SIZES,
+    );
+    const candidates = region
+      ? availability.filter((item) => item.region === region)
+      : [...availability].sort((a, b) =>
+        regionPreferenceIndex(a.region) - regionPreferenceIndex(b.region)
+      );
+    const found = candidates.find((item) => item.availableSizes.length > 0);
+    if (!found) {
+      throw new ProviderError("azure", "no free student vm size available", {
+        userMessage:
+          "当前订阅没有找到可用的 Azure 学生免费规格区域，请先查看「免费规格区域」或手动选择规格。",
+      });
+    }
+    const size = AZURE_STUDENT_FREE_SIZES.find((item) =>
+      found.availableSizes.includes(item)
+    )!;
+    return {
+      region: found.region,
+      size,
+      image: azureStudentImageForSize(size),
+      resourceGroup: await this.defaultResourceGroup(),
+      osDiskSizeGb: AZURE_STUDENT_OS_DISK_SIZE_GB,
+      osDiskStorageAccountType: AZURE_STUDENT_OS_DISK_STORAGE,
+    };
+  }
+
+  private async tryCreditBalance(
+    warnings: string[],
+  ): Promise<{ currency?: string; lines?: SubscriptionBalance["credit"] }> {
+    try {
+      const accounts = await this.requestUrl<
+        { value?: { name?: string; displayName?: string }[] }
+      >(
+        "GET",
+        `${BASE}/providers/Microsoft.Billing/billingAccounts?api-version=${BILLING_API}`,
+      );
+      const lines: SubscriptionBalance["credit"] = [];
+      let currency: string | undefined;
+      for (const account of accounts.value ?? []) {
+        if (!account.name) continue;
+        const profiles = await this.requestUrl<
+          { value?: { name?: string; displayName?: string }[] }
+        >(
+          "GET",
+          `${BASE}/providers/Microsoft.Billing/billingAccounts/${
+            encodeURIComponent(account.name)
+          }/billingProfiles?api-version=${BILLING_API}`,
+        );
+        for (const profile of profiles.value ?? []) {
+          if (!profile.name) continue;
+          const summary = await this.requestUrl<AzureCreditSummary>(
+            "GET",
+            `${BASE}/providers/Microsoft.Billing/billingAccounts/${
+              encodeURIComponent(account.name)
+            }/billingProfiles/${
+              encodeURIComponent(profile.name)
+            }/providers/Microsoft.Consumption/credits/balanceSummary?api-version=${CONSUMPTION_API}`,
+          );
+          const balance = summary.balanceSummary;
+          for (
+            const [name, amount] of [
+              ["可用余额", balance?.availableBalance],
+              ["当前余额", balance?.currentBalance],
+              ["预估余额", balance?.estimatedBalance],
+            ] as const
+          ) {
+            if (amount?.amount === undefined) continue;
+            currency ??= amount.currency;
+            lines.push({
+              name: `${profile.displayName ?? profile.name} ${name}`,
+              amount: amount.amount,
+              currency: amount.currency,
+            });
+          }
+        }
+      }
+      return { currency, lines: lines.length > 0 ? lines : undefined };
+    } catch (error) {
+      warnings.push(
+        `无法读取 Billing 信用余额：${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return {};
+    }
+  }
+
+  private async tryMonthToDateCost(
+    sub: string,
+    warnings: string[],
+  ): Promise<{ amount?: number; currency?: string }> {
+    try {
+      const data = await this.request<
+        {
+          properties?: {
+            columns?: { name?: string }[];
+            rows?: unknown[][];
+          };
+        }
+      >(
+        "POST",
+        `/subscriptions/${sub}/providers/Microsoft.CostManagement/query`,
+        COST_MANAGEMENT_API,
+        {
+          type: "ActualCost",
+          timeframe: "MonthToDate",
+          dataset: {
+            granularity: "None",
+            aggregation: {
+              totalCost: { name: "Cost", function: "Sum" },
+            },
+          },
+        },
+      );
+      const columns = data.properties?.columns ?? [];
+      const row = data.properties?.rows?.[0] ?? [];
+      const costIndex = columns.findIndex((item) =>
+        item.name?.toLowerCase().includes("cost")
+      );
+      const currencyIndex = columns.findIndex((item) =>
+        item.name?.toLowerCase().includes("currency")
+      );
+      const amount = typeof row[costIndex] === "number"
+        ? row[costIndex]
+        : undefined;
+      const currency = typeof row[currencyIndex] === "string"
+        ? row[currencyIndex]
+        : undefined;
+      return { amount, currency };
+    } catch (error) {
+      warnings.push(
+        `无法读取本月成本：${
+          error instanceof Error ? error.message : String(error)
+        }`,
+      );
+      return {};
+    }
   }
 
   async listInstances(_opts?: ListOptions): Promise<InstanceList> {
@@ -463,7 +951,32 @@ export class AzureAdapter implements ProviderAdapter {
   async deleteInstance(id: string, locator?: InstanceLocator): Promise<void> {
     const rg = this.requireResourceGroup(locator);
     const sub = await this.sub();
-    await this.request("DELETE", this.vmPath(sub, id, rg), COMPUTE_API);
+    const path = this.vmPath(sub, id, rg);
+    const vm = await this.request<AzureVm>("GET", path, COMPUTE_API);
+    const nicIds = (vm.properties?.networkProfile?.networkInterfaces ?? [])
+      .map((nic) => nic.id)
+      .filter((nicId): nicId is string => Boolean(nicId));
+    const diskId = vm.properties?.storageProfile?.osDisk?.managedDisk?.id;
+    const publicIpIds: string[] = [];
+    for (const nicId of nicIds) {
+      try {
+        const nic = await this.request<AzureNic>("GET", nicId, NETWORK_API);
+        for (const config of nic.properties?.ipConfigurations ?? []) {
+          const pipId = config.properties?.publicIPAddress?.id;
+          if (pipId) publicIpIds.push(pipId);
+        }
+      } catch {
+        void 0;
+      }
+    }
+    await this.deleteIfExists(path, COMPUTE_API);
+    for (const nicId of nicIds) {
+      await this.deleteIfExists(nicId, NETWORK_API);
+    }
+    for (const pipId of publicIpIds) {
+      await this.deleteIfExists(pipId, NETWORK_API);
+    }
+    if (diskId) await this.deleteIfExists(diskId, DISK_API);
   }
 
   renameInstance(): Promise<void> {
@@ -687,11 +1200,48 @@ export class AzureAdapter implements ProviderAdapter {
     }
   }
 
-  async createInstance(input: CreateInstanceInput): Promise<Instance> {
-    const rg = this.resourceGroup;
-    if (!rg) {
-      throw new ValidationError("Azure 创建虚拟机需要资源组（resourceGroup）");
+  private async waitDeleted(
+    path: string,
+    apiVersion: string,
+  ): Promise<void> {
+    for (let i = 0; i < 60; i++) {
+      try {
+        await this.request("GET", path, apiVersion);
+      } catch (error) {
+        if (error instanceof ProviderError && error.status === 404) return;
+        throw error;
+      }
+      await delay(2000);
     }
+  }
+
+  private async deleteIfExists(
+    path: string,
+    apiVersion: string,
+  ): Promise<void> {
+    try {
+      await this.request("DELETE", path, apiVersion);
+      await this.waitDeleted(path, apiVersion);
+    } catch (error) {
+      if (error instanceof ProviderError && error.status === 404) return;
+      throw error;
+    }
+  }
+
+  private async bestEffortDelete(
+    resources: { path: string; apiVersion: string }[],
+  ): Promise<void> {
+    for (const resource of resources) {
+      try {
+        await this.deleteIfExists(resource.path, resource.apiVersion);
+      } catch {
+        void 0;
+      }
+    }
+  }
+
+  async createInstance(input: CreateInstanceInput): Promise<Instance> {
+    const rg = input.resourceGroup ?? await this.defaultResourceGroup();
     const location = input.region;
     if (!location) {
       throw new ValidationError("Azure 需要区域（region/location）");
@@ -705,100 +1255,189 @@ export class AzureAdapter implements ProviderAdapter {
     const imageRef = parseImageReference(input.image);
     const sub = await this.sub();
     const base = `/subscriptions/${sub}/resourceGroups/${rg}/providers`;
+    await this.ensureResourceGroup(sub, rg, location);
 
     const pipName = `${name}-ip`;
-    const pip = await this.request<{ id: string }>(
-      "PUT",
-      `${base}/Microsoft.Network/publicIPAddresses/${pipName}`,
-      NETWORK_API,
-      {
-        location,
-        sku: { name: "Standard" },
-        properties: { publicIPAllocationMethod: "Static" },
-      },
-    );
-
-    const vnetName = "debot-vnet";
-    await this.request(
-      "PUT",
-      `${base}/Microsoft.Network/virtualNetworks/${vnetName}`,
-      NETWORK_API,
-      {
-        location,
-        properties: {
-          addressSpace: { addressPrefixes: ["10.20.0.0/16"] },
-          subnets: [
-            { name: "default", properties: { addressPrefix: "10.20.0.0/24" } },
-          ],
-        },
-      },
-    );
-    const subnetId =
-      `${base}/Microsoft.Network/virtualNetworks/${vnetName}/subnets/default`;
-
+    const pipPath = `${base}/Microsoft.Network/publicIPAddresses/${pipName}`;
+    const ipv6PipName = `${name}-ipv6`;
+    const ipv6PipPath =
+      `${base}/Microsoft.Network/publicIPAddresses/${ipv6PipName}`;
+    const vnetName = `debot-${location}-vnet`;
+    const vnetPath = `${base}/Microsoft.Network/virtualNetworks/${vnetName}`;
     const nicName = `${name}-nic`;
-    const nic = await this.request<{ id: string }>(
-      "PUT",
-      `${base}/Microsoft.Network/networkInterfaces/${nicName}`,
-      NETWORK_API,
-      {
+    const nicPath = `${base}/Microsoft.Network/networkInterfaces/${nicName}`;
+    const vmCreatePath = this.vmPath(sub, name, rg);
+    const diskPath = `${base}/Microsoft.Compute/disks/${name}-osdisk`;
+    let vnetExisted = false;
+    try {
+      await this.request("GET", vnetPath, NETWORK_API);
+      vnetExisted = true;
+    } catch (error) {
+      if (!(error instanceof ProviderError) || error.status !== 404) {
+        throw error;
+      }
+    }
+
+    try {
+      const pip = await this.request<{ id: string }>(
+        "PUT",
+        pipPath,
+        NETWORK_API,
+        {
+          location,
+          sku: { name: "Standard" },
+          properties: {
+            publicIPAllocationMethod: "Static",
+            publicIPAddressVersion: "IPv4",
+          },
+        },
+      );
+      await this.pollProvisioning(
+        pipPath,
+        NETWORK_API,
+      );
+
+      let ipv6PipId: string | undefined;
+      if (input.enableIpv6) {
+        const ipv6Pip = await this.request<{ id: string }>(
+          "PUT",
+          ipv6PipPath,
+          NETWORK_API,
+          {
+            location,
+            sku: { name: "Standard" },
+            properties: {
+              publicIPAllocationMethod: "Static",
+              publicIPAddressVersion: "IPv6",
+            },
+          },
+        );
+        ipv6PipId = ipv6Pip.id;
+        await this.pollProvisioning(
+          ipv6PipPath,
+          NETWORK_API,
+        );
+      }
+
+      const subnetProperties = input.enableIpv6
+        ? { addressPrefixes: ["10.20.0.0/24", IPV6_SUBNET_PREFIX] }
+        : { addressPrefix: "10.20.0.0/24" };
+      await this.request(
+        "PUT",
+        vnetPath,
+        NETWORK_API,
+        {
+          location,
+          properties: {
+            addressSpace: {
+              addressPrefixes: input.enableIpv6
+                ? ["10.20.0.0/16", IPV6_VNET_PREFIX]
+                : ["10.20.0.0/16"],
+            },
+            subnets: [
+              { name: "default", properties: subnetProperties },
+            ],
+          },
+        },
+      );
+      await this.pollProvisioning(vnetPath, NETWORK_API);
+      const subnetId =
+        `${base}/Microsoft.Network/virtualNetworks/${vnetName}/subnets/default`;
+
+      const ipConfigurations = [
+        {
+          name: "ipconfig1",
+          properties: {
+            primary: true,
+            privateIPAddressVersion: "IPv4",
+            subnet: { id: subnetId },
+            publicIPAddress: { id: pip.id },
+          },
+        },
+      ];
+      if (ipv6PipId) {
+        ipConfigurations.push({
+          name: "ipv6config",
+          properties: {
+            primary: false,
+            privateIPAddressVersion: "IPv6",
+            subnet: { id: subnetId },
+            publicIPAddress: { id: ipv6PipId },
+          },
+        });
+      }
+      const nic = await this.request<{ id: string }>(
+        "PUT",
+        nicPath,
+        NETWORK_API,
+        {
+          location,
+          properties: {
+            ipConfigurations,
+          },
+        },
+      );
+      await this.pollProvisioning(nicPath, NETWORK_API);
+
+      await this.request("PUT", vmCreatePath, COMPUTE_API, {
         location,
+        tags: input.tags,
         properties: {
-          ipConfigurations: [
-            {
-              name: "ipconfig1",
-              properties: {
-                subnet: { id: subnetId },
-                publicIPAddress: { id: pip.id },
+          hardwareProfile: { vmSize: input.size },
+          storageProfile: {
+            imageReference: imageRef,
+            osDisk: {
+              name: `${name}-osdisk`,
+              createOption: "FromImage",
+              diskSizeGB: input.osDiskSizeGb,
+              managedDisk: {
+                storageAccountType: input.osDiskStorageAccountType ??
+                  "Standard_LRS",
               },
             },
-          ],
-        },
-      },
-    );
-
-    await this.request("PUT", this.vmPath(sub, name, rg), COMPUTE_API, {
-      location,
-      tags: input.tags,
-      properties: {
-        hardwareProfile: { vmSize: input.size },
-        storageProfile: {
-          imageReference: imageRef,
-          osDisk: {
-            createOption: "FromImage",
-            managedDisk: { storageAccountType: "Standard_LRS" },
           },
-        },
-        osProfile: {
-          computerName: name,
-          adminUsername: "azureuser",
-          linuxConfiguration: {
-            disablePasswordAuthentication: true,
-            ssh: {
-              publicKeys: [
-                {
-                  path: "/home/azureuser/.ssh/authorized_keys",
-                  keyData: input.sshKeyId,
-                },
-              ],
+          osProfile: {
+            computerName: name,
+            adminUsername: "azureuser",
+            linuxConfiguration: {
+              disablePasswordAuthentication: true,
+              ssh: {
+                publicKeys: [
+                  {
+                    path: "/home/azureuser/.ssh/authorized_keys",
+                    keyData: input.sshKeyId,
+                  },
+                ],
+              },
             },
+            customData: input.userData ? btoa(input.userData) : undefined,
           },
-          customData: input.userData ? btoa(input.userData) : undefined,
+          networkProfile: {
+            networkInterfaces: [{ id: nic.id }],
+          },
         },
-        networkProfile: {
-          networkInterfaces: [{ id: nic.id }],
-        },
-      },
-    });
+      });
 
-    return {
-      id: name,
-      name,
-      state: "pending",
-      region: location,
-      size: input.size,
-      image: input.image,
-    };
+      return {
+        id: name,
+        name,
+        state: "pending",
+        region: location,
+        resourceGroup: rg,
+        size: input.size,
+        image: input.image,
+      };
+    } catch (error) {
+      await this.bestEffortDelete([
+        { path: vmCreatePath, apiVersion: COMPUTE_API },
+        { path: nicPath, apiVersion: NETWORK_API },
+        { path: ipv6PipPath, apiVersion: NETWORK_API },
+        { path: pipPath, apiVersion: NETWORK_API },
+        { path: diskPath, apiVersion: DISK_API },
+        ...(vnetExisted ? [] : [{ path: vnetPath, apiVersion: NETWORK_API }]),
+      ]);
+      throw error;
+    }
   }
 }
 

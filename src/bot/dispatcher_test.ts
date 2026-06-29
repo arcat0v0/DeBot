@@ -13,10 +13,15 @@ import type { AdapterFactory } from "../cloud/service.ts";
 import { MockAdapter } from "../cloud/providers/mock.ts";
 import type {
   Capabilities,
+  CreateInstanceInput,
+  DefaultCreateOption,
   FirewallRule,
   FirewallRuleInput,
   InstanceLocator,
   ProviderId,
+  RegionAvailability,
+  SubscriptionBalance,
+  SubscriptionInfo,
 } from "../cloud/types.ts";
 import { SessionStore } from "./sessions.ts";
 import { Dispatcher } from "./dispatcher.ts";
@@ -103,6 +108,69 @@ class FirewallMockAdapter extends MockAdapter {
   ): Promise<void> {
     this.rules = this.rules.filter((rule) => rule.name !== ruleName);
     return Promise.resolve();
+  }
+}
+
+class AzureFeatureMockAdapter extends MockAdapter {
+  createInputs: CreateInstanceInput[] = [];
+
+  override capabilities(): Capabilities {
+    return {
+      ...super.capabilities(),
+      regionAvailability: true,
+      balance: true,
+      subscriptionInfo: true,
+      ipv6: true,
+      customCreate: true,
+    };
+  }
+
+  getSubscriptionInfo(): Promise<SubscriptionInfo> {
+    return Promise.resolve({
+      id: "sub",
+      displayName: "Azure for Students",
+      state: "Enabled",
+      quotaId: "MS-AZR-0170P",
+      spendingLimit: "On",
+      isStudent: true,
+      studentReason: "quota matched",
+    });
+  }
+
+  getSubscriptionBalance(): Promise<SubscriptionBalance> {
+    return Promise.resolve({
+      subscriptionId: "sub",
+      currency: "USD",
+      credit: [{ name: "可用余额", amount: 88, currency: "USD" }],
+      monthToDateCost: 1.5,
+    });
+  }
+
+  listRegionAvailability(): Promise<RegionAvailability[]> {
+    return Promise.resolve([
+      {
+        region: "eastasia",
+        displayName: "East Asia",
+        availableSizes: ["Standard_B1s"],
+        restrictedSizes: ["Standard_B2ats_v2", "Standard_B2pts_v2"],
+      },
+    ]);
+  }
+
+  selectDefaultCreateOption(region?: string): Promise<DefaultCreateOption> {
+    return Promise.resolve({
+      region: region ?? "eastasia",
+      size: "Standard_B1s",
+      image: "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest",
+      resourceGroup: "debot",
+      osDiskSizeGb: 64,
+      osDiskStorageAccountType: "Premium_LRS",
+    });
+  }
+
+  override createInstance(input: CreateInstanceInput) {
+    this.createInputs.push(input);
+    return super.createInstance(input);
   }
 }
 
@@ -288,6 +356,112 @@ Deno.test("azure firewall rules can be added and deleted", async () => {
 
     await dispatcher.handleUpdate(callback("fw:z:x:0:delok:0"));
     assertEquals(firewall.rules.length, 0);
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+Deno.test("azure subscription tools and student default create are available", async () => {
+  const azure = new AzureFeatureMockAdapter({
+    id: "azure",
+    label: "Mock Azure",
+  });
+  const { dir, api, dispatcher, profiles, jobs, jobStore } = await setup(
+    [USER],
+    (provider) =>
+      provider === "azure"
+        ? azure
+        : new MockAdapter({ id: provider, label: `Mock ${provider}` }),
+  );
+  try {
+    await profiles.add({
+      name: "primary",
+      provider: "azure",
+      credentials: {
+        tenantId: "tenant",
+        clientId: "client",
+        clientSecret: "secret",
+        subscriptionId: "sub",
+      },
+    });
+
+    await dispatcher.handleUpdate(callback("svc:z:x"));
+    assert(
+      JSON.stringify(api.edits.at(-1)?.reply_markup).includes("订阅余额"),
+    );
+
+    await dispatcher.handleUpdate(callback("az:z:x:sub"));
+    assert(api.lastEditText().includes("学生订阅：是"));
+
+    await dispatcher.handleUpdate(callback("az:z:x:bal"));
+    assert(api.lastEditText().includes("88 USD"));
+
+    await dispatcher.handleUpdate(callback("az:z:x:avail"));
+    assert(api.lastEditText().includes("Standard_B1s"));
+
+    await dispatcher.handleUpdate(callback("cr:z:x"));
+    assert(api.lastEditText().includes("学生免费默认"));
+    assert(
+      JSON.stringify(api.edits.at(-1)?.reply_markup).includes("手动填写创建"),
+    );
+
+    await dispatcher.handleUpdate(callback("az:z:x:student:1"));
+    assert(api.lastSendText().includes("SSH 公钥"));
+
+    await dispatcher.handleUpdate(message("ssh-rsa AAAATEST user@host"));
+    await jobs.idle();
+    assertEquals(azure.createInputs.length, 1);
+    assertEquals(azure.createInputs[0].enableIpv6, true);
+    assertEquals(azure.createInputs[0].size, "Standard_B1s");
+    assertEquals(azure.createInputs[0].resourceGroup, "debot");
+    const recent = await jobStore.recent(5);
+    assert(
+      recent.some((job) => job.kind === "create" && job.status === "succeeded"),
+    );
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+Deno.test("azure custom create accepts parameters without presets", async () => {
+  const azure = new AzureFeatureMockAdapter({
+    id: "azure",
+    label: "Mock Azure",
+  });
+  const { dir, api, dispatcher, profiles, jobs } = await setup(
+    [USER],
+    (provider) =>
+      provider === "azure"
+        ? azure
+        : new MockAdapter({ id: provider, label: `Mock ${provider}` }),
+  );
+  try {
+    await profiles.add({
+      name: "primary",
+      provider: "azure",
+      defaultRegion: "eastasia",
+      credentials: {
+        tenantId: "tenant",
+        clientId: "client",
+        clientSecret: "secret",
+        subscriptionId: "sub",
+      },
+    });
+
+    await dispatcher.handleUpdate(callback("az:z:x:custom"));
+    assert(api.lastSendText().includes("创建参数"));
+
+    await dispatcher.handleUpdate(
+      message(
+        "myvm | - | custom-rg | img:offer:sku:latest | Standard_B1s | ssh-ed25519 AAAATEST user@host | yes",
+      ),
+    );
+    await jobs.idle();
+    assertEquals(azure.createInputs.length, 1);
+    assertEquals(azure.createInputs[0].name, "myvm");
+    assertEquals(azure.createInputs[0].region, "eastasia");
+    assertEquals(azure.createInputs[0].resourceGroup, "custom-rg");
+    assertEquals(azure.createInputs[0].enableIpv6, true);
   } finally {
     await cleanup(dir);
   }

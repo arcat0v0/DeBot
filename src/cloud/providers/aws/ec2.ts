@@ -127,8 +127,12 @@ export class Ec2Adapter implements ProviderAdapter {
       delete: true,
       rename: true,
       regions: true,
+      regionAvailability: false,
+      balance: false,
+      subscriptionInfo: false,
       ipv6: false,
       firewall: false,
+      customCreate: true,
     };
   }
 

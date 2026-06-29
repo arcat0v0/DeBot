@@ -89,16 +89,21 @@ or JSON:
 }
 ```
 
-`resourceGroup` is required for per-VM actions (start/stop/restart/delete) and
-for creating VMs and managing VM firewall rules.
+`resourceGroup` is optional when the service principal is scoped at the
+subscription level. Creation uses the credential resource group when present,
+otherwise it uses the single accessible resource group when Azure returns
+exactly one; if there is no unique existing group, it creates/uses `debot`.
+Per-VM actions discover the resource group from the instance list; direct
+firewall or lifecycle operations still need the VM to have been listed first or
+the credential resource group to be set.
 
 **Role**
 
-Assign the service principal a scoped role on the resource group, e.g. the
-built-in **Virtual Machine Contributor** plus **Network Contributor** (creation
-provisions a public IP, virtual network and NIC; firewall management reads,
-creates and updates NIC-level Network Security Groups). For read/lifecycle only,
-Virtual Machine Contributor is sufficient.
+Assign the service principal either a subscription-scoped **Contributor** role
+or resource-group-scoped roles. Subscription-scoped Contributor lets DeBot query
+subscription metadata, list restricted regions/SKUs and create the default
+`debot` resource group. Resource-group scope is enough for managing existing VMs
+inside that group.
 
 Create a service principal:
 
@@ -110,6 +115,28 @@ az ad sp create-for-rbac --name debot \
 
 If you want DeBot to create VMs, add public IPv6, or manage Azure firewall
 rules, also grant **Network Contributor** on the same resource group.
+
+For Azure for Students, DeBot can:
+
+- Query whether the subscription looks like a student subscription using Azure
+  subscription policy fields such as `quotaId`.
+- Query subscription balance. Azure may require billing-profile permissions for
+  the exact credit balance; when those are not available, DeBot falls back to
+  the current month cost query and shows the permission warning.
+- Query regions where the student-free VM sizes are not restricted for the
+  subscription.
+- Create a default student VM from the built-in profile: `Standard_B1s`, falling
+  back to other free student sizes only if needed, Ubuntu 22.04, 64 GiB Premium
+  SSD, admin user `azureuser`, automatic resource group selection, and optional
+  public IPv6.
+
+Manual Azure creation without a saved preset uses:
+
+```
+name | region | resourceGroup | image | size | sshPublicKey | ipv6
+```
+
+Use `-` for optional `name` or `resourceGroup`; `ipv6` accepts `yes`/`no`.
 
 **Firewall behavior**
 

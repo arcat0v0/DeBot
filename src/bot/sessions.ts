@@ -45,6 +45,21 @@ export type Flow =
     chatId: number;
     messageId: number;
   }
+  | {
+    kind: "azure_student_create";
+    service: string;
+    region?: string;
+    enableIpv6: boolean;
+    chatId: number;
+    messageId?: number;
+  }
+  | {
+    kind: "azure_custom_create";
+    service: string;
+    region?: string;
+    chatId: number;
+    messageId?: number;
+  }
   | { kind: "add_preset"; provider: ProviderId };
 
 export interface Session {

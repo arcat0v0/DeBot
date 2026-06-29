@@ -1,4 +1,4 @@
-import { assert, assertEquals } from "@std/assert";
+import { assert, assertEquals, assertRejects } from "@std/assert";
 import { AzureAdapter } from "./adapter.ts";
 
 const SUB = "sub";
@@ -139,4 +139,335 @@ Deno.test("AzureAdapter manages NIC-level firewall rules", async () => {
   await adapter.deleteFirewallRule("vm1", "ssh");
   assertEquals(await adapter.listFirewallRules("vm1"), []);
   assert(calls.some((call) => call.method === "PUT" && call.path === NSG_ID));
+});
+
+Deno.test("AzureAdapter reports subscription info, cost and student SKU regions", async () => {
+  const fetchImpl: typeof fetch = (async (input, init) => {
+    await Promise.resolve();
+    const url = new URL(String(input));
+    if (url.hostname === "login.microsoftonline.com") {
+      return Response.json({ access_token: "token", expires_in: 3600 });
+    }
+    const method = init?.method ?? "GET";
+
+    if (method === "GET" && url.pathname === `/subscriptions/${SUB}`) {
+      return Response.json({
+        subscriptionId: SUB,
+        displayName: "Azure for Students",
+        state: "Enabled",
+        tenantId: "tenant",
+        subscriptionPolicies: {
+          quotaId: "MS-AZR-0170P",
+          spendingLimit: "On",
+        },
+      });
+    }
+    if (
+      method === "GET" && url.pathname === `/subscriptions/${SUB}/locations`
+    ) {
+      return Response.json({
+        value: [
+          {
+            name: "eastasia",
+            displayName: "East Asia",
+            metadata: { regionCategory: "Recommended" },
+          },
+          { name: "westus", displayName: "West US" },
+        ],
+      });
+    }
+    if (
+      method === "GET" &&
+      url.pathname === `/subscriptions/${SUB}/resourcegroups`
+    ) {
+      return Response.json({ value: [{ name: "only-rg" }] });
+    }
+    if (
+      method === "GET" &&
+      url.pathname ===
+        `/subscriptions/${SUB}/providers/Microsoft.Compute/skus`
+    ) {
+      return Response.json({
+        value: [
+          {
+            name: "Standard_B1s",
+            resourceType: "virtualMachines",
+            locations: ["eastasia", "westus"],
+            restrictions: [
+              {
+                type: "Location",
+                values: ["westus"],
+                reasonCode: "NotAvailableForSubscription",
+              },
+            ],
+          },
+          {
+            name: "Standard_B2ats_v2",
+            resourceType: "virtualMachines",
+            locations: ["EastAsia"],
+            restrictions: [
+              {
+                type: "Zone",
+                values: ["EastAsia"],
+                reasonCode: "NotAvailableForSubscription",
+              },
+            ],
+          },
+        ],
+      });
+    }
+    if (
+      method === "POST" &&
+      url.pathname ===
+        `/subscriptions/${SUB}/providers/Microsoft.CostManagement/query`
+    ) {
+      return Response.json({
+        properties: {
+          columns: [{ name: "Cost" }, { name: "Currency" }],
+          rows: [[1.23, "USD"]],
+        },
+      });
+    }
+    if (
+      method === "GET" &&
+      url.pathname === "/providers/Microsoft.Billing/billingAccounts"
+    ) {
+      return Response.json({ error: { message: "billing denied" } }, {
+        status: 403,
+      });
+    }
+    return Response.json({ error: { message: `${method} ${url.pathname}` } }, {
+      status: 404,
+    });
+  }) as typeof fetch;
+
+  const adapter = new AzureAdapter({
+    credentials: {
+      tenantId: "tenant",
+      clientId: "client",
+      clientSecret: "secret",
+      subscriptionId: SUB,
+    },
+    fetch: fetchImpl,
+  });
+
+  const info = await adapter.getSubscriptionInfo();
+  assertEquals(info.isStudent, true);
+  assertEquals(info.quotaId, "MS-AZR-0170P");
+
+  const availability = await adapter.listRegionAvailability();
+  assertEquals(
+    availability.find((item) => item.region === "eastasia")
+      ?.availableSizes,
+    ["Standard_B1s", "Standard_B2ats_v2"],
+  );
+  assertEquals(
+    availability.find((item) => item.region === "westus")
+      ?.availableSizes,
+    [],
+  );
+
+  const option = await adapter.selectDefaultCreateOption("eastasia");
+  assertEquals(option.size, "Standard_B1s");
+  assertEquals(option.resourceGroup, "only-rg");
+
+  const balance = await adapter.getSubscriptionBalance();
+  assertEquals(balance.monthToDateCost, 1.23);
+  assertEquals(balance.currency, "USD");
+  assert(balance.warnings?.some((warning) => warning.includes("Billing")));
+});
+
+Deno.test("AzureAdapter deletes VM dependencies created with the instance", async () => {
+  const diskId =
+    `/subscriptions/${SUB}/resourceGroups/${RG}/providers/Microsoft.Compute/disks/vm1-os`;
+  const pipId =
+    `/subscriptions/${SUB}/resourceGroups/${RG}/providers/Microsoft.Network/publicIPAddresses/vm1-ip`;
+  const deleted = new Set<string>();
+  const calls: { method: string; path: string; apiVersion?: string }[] = [];
+  const fetchImpl: typeof fetch = (async (input, init) => {
+    await Promise.resolve();
+    const url = new URL(String(input));
+    if (url.hostname === "login.microsoftonline.com") {
+      return Response.json({ access_token: "token", expires_in: 3600 });
+    }
+    const method = init?.method ?? "GET";
+    calls.push({
+      method,
+      path: url.pathname,
+      apiVersion: url.searchParams.get("api-version") ?? undefined,
+    });
+    if (method === "GET" && deleted.has(url.pathname)) {
+      return Response.json({ error: { message: "not found" } }, {
+        status: 404,
+      });
+    }
+    if (
+      method === "GET" &&
+      url.pathname ===
+        `/subscriptions/${SUB}/resourceGroups/${RG}/providers/Microsoft.Compute/virtualMachines/vm1`
+    ) {
+      return Response.json({
+        name: "vm1",
+        location: "eastasia",
+        properties: {
+          storageProfile: { osDisk: { managedDisk: { id: diskId } } },
+          networkProfile: { networkInterfaces: [{ id: NIC_ID }] },
+        },
+      });
+    }
+    if (method === "GET" && url.pathname === NIC_ID) {
+      return Response.json({
+        id: NIC_ID,
+        properties: {
+          ipConfigurations: [
+            { properties: { publicIPAddress: { id: pipId } } },
+          ],
+        },
+      });
+    }
+    if (
+      method === "GET" &&
+      [diskId, pipId].includes(url.pathname)
+    ) {
+      return Response.json({ id: url.pathname });
+    }
+    if (method === "DELETE") {
+      deleted.add(url.pathname);
+      return new Response(null, { status: 202 });
+    }
+    return Response.json({ error: { message: `${method} ${url.pathname}` } }, {
+      status: 404,
+    });
+  }) as typeof fetch;
+
+  const adapter = new AzureAdapter({
+    credentials: {
+      tenantId: "tenant",
+      clientId: "client",
+      clientSecret: "secret",
+      subscriptionId: SUB,
+      resourceGroup: RG,
+    },
+    fetch: fetchImpl,
+  });
+
+  await adapter.deleteInstance("vm1");
+
+  assert(calls.some((call) =>
+    call.method === "DELETE" && call.path ===
+      `/subscriptions/${SUB}/resourceGroups/${RG}/providers/Microsoft.Compute/virtualMachines/vm1`
+  ));
+  assert(
+    calls.some((call) => call.method === "DELETE" && call.path === NIC_ID),
+  );
+  assert(calls.some((call) => call.method === "DELETE" && call.path === pipId));
+  assert(
+    calls.some((call) =>
+      call.method === "DELETE" && call.path === diskId &&
+      call.apiVersion === "2023-10-02"
+    ),
+  );
+});
+
+Deno.test("AzureAdapter cleans partial create resources after failure", async () => {
+  const name = "vmfail";
+  const paths = {
+    rg: `/subscriptions/${SUB}/resourceGroups/${RG}`,
+    pip:
+      `/subscriptions/${SUB}/resourceGroups/${RG}/providers/Microsoft.Network/publicIPAddresses/${name}-ip`,
+    ipv6:
+      `/subscriptions/${SUB}/resourceGroups/${RG}/providers/Microsoft.Network/publicIPAddresses/${name}-ipv6`,
+    vnet:
+      `/subscriptions/${SUB}/resourceGroups/${RG}/providers/Microsoft.Network/virtualNetworks/debot-eastasia-vnet`,
+    nic:
+      `/subscriptions/${SUB}/resourceGroups/${RG}/providers/Microsoft.Network/networkInterfaces/${name}-nic`,
+    vm:
+      `/subscriptions/${SUB}/resourceGroups/${RG}/providers/Microsoft.Compute/virtualMachines/${name}`,
+    disk:
+      `/subscriptions/${SUB}/resourceGroups/${RG}/providers/Microsoft.Compute/disks/${name}-osdisk`,
+  };
+  const existing = new Set([paths.rg]);
+  const deleted: string[] = [];
+  const fetchImpl: typeof fetch = (async (input, init) => {
+    await Promise.resolve();
+    const url = new URL(String(input));
+    if (url.hostname === "login.microsoftonline.com") {
+      return Response.json({ access_token: "token", expires_in: 3600 });
+    }
+    const method = init?.method ?? "GET";
+    const body = init?.body ? JSON.parse(String(init.body)) : undefined;
+    if (method === "GET") {
+      if (existing.has(url.pathname)) {
+        return Response.json({
+          id: url.pathname,
+          properties: { provisioningState: "Succeeded" },
+        });
+      }
+      return Response.json({ error: { message: "not found" } }, {
+        status: 404,
+      });
+    }
+    if (method === "PUT" && url.pathname === paths.pip) {
+      existing.add(paths.pip);
+      return Response.json({
+        id: paths.pip,
+        properties: { provisioningState: "Succeeded" },
+      });
+    }
+    if (method === "PUT" && url.pathname === paths.ipv6) {
+      return Response.json({ error: { message: "ipv6 quota" } }, {
+        status: 400,
+      });
+    }
+    if (method === "PUT" && url.pathname === paths.vnet) {
+      existing.add(paths.vnet);
+      return Response.json({
+        id: paths.vnet,
+        properties: { provisioningState: "Succeeded" },
+      });
+    }
+    if (method === "PUT" && url.pathname === paths.nic) {
+      existing.add(paths.nic);
+      return Response.json({ id: paths.nic });
+    }
+    if (method === "PUT" && url.pathname === paths.vm) {
+      existing.add(paths.vm);
+      const props = body?.properties as Record<string, unknown> | undefined;
+      assert(props);
+      return Response.json({ id: paths.vm });
+    }
+    if (method === "DELETE") {
+      deleted.push(url.pathname);
+      existing.delete(url.pathname);
+      return new Response(null, { status: 202 });
+    }
+    return Response.json({ error: { message: `${method} ${url.pathname}` } }, {
+      status: 404,
+    });
+  }) as typeof fetch;
+
+  const adapter = new AzureAdapter({
+    credentials: {
+      tenantId: "tenant",
+      clientId: "client",
+      clientSecret: "secret",
+      subscriptionId: SUB,
+      resourceGroup: RG,
+    },
+    fetch: fetchImpl,
+  });
+
+  await assertRejects(() =>
+    adapter.createInstance({
+      name,
+      region: "eastasia",
+      image: "Canonical:0001-com-ubuntu-server-jammy:22_04-lts-gen2:latest",
+      size: "Standard_B2ats_v2",
+      sshKeyId: "ssh-ed25519 AAAATEST user@host",
+      enableIpv6: true,
+    })
+  );
+
+  assert(deleted.includes(paths.pip));
+  assert(deleted.includes(paths.vnet));
 });

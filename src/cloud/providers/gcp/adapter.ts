@@ -129,8 +129,12 @@ export class GcpAdapter implements ProviderAdapter {
       delete: true,
       rename: false,
       regions: true,
+      regionAvailability: false,
+      balance: false,
+      subscriptionInfo: false,
       ipv6: false,
       firewall: false,
+      customCreate: true,
     };
   }
 
