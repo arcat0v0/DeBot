@@ -70,7 +70,7 @@ export interface CreateInstanceInput {
   osDiskStorageAccountType?: string;
 }
 
-export type FirewallProtocol = "Tcp" | "Udp" | "Icmp" | "*";
+export type FirewallProtocol = "Tcp" | "Udp" | "Icmp" | "Icmpv6" | "*";
 export type FirewallAccess = "Allow" | "Deny";
 export type FirewallDirection = "Inbound" | "Outbound";
 
@@ -221,6 +221,10 @@ export interface ProviderAdapter {
     ruleName: string,
     locator?: InstanceLocator,
   ): Promise<void>;
+  allowAllInboundTraffic?(
+    id: string,
+    locator?: InstanceLocator,
+  ): Promise<FirewallRule[]>;
   listBundles?(): Promise<CatalogBundle[]>;
   listBlueprints?(): Promise<CatalogBlueprint[]>;
 }

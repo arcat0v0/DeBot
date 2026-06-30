@@ -117,14 +117,14 @@ export function firewallRulesDetail(
   instanceName: string,
 ): string {
   const lines = [
-    bold("Azure 防火墙"),
+    bold("防火墙入站规则"),
     `机器：${code(instanceName)}`,
     "",
   ];
   if (rules.length === 0) {
     lines.push(
-      "暂无网卡 NSG 自定义入站规则。",
-      "开放端口时会自动创建或更新该机器网卡绑定的 NSG。",
+      "暂无自定义入站规则。",
+      "开放端口或放通全部入站时，会在该实例关联的防火墙上创建规则。",
     );
   } else {
     for (const rule of rules) lines.push(firewallRuleLine(rule));
@@ -133,7 +133,9 @@ export function firewallRulesDetail(
     "",
     "新增格式：",
     `${code("tcp 22 0.0.0.0/0 ssh")}`,
-    "来源和名称可省略，来源默认 *。",
+    `${code("tcp 443 ::/0 https-v6")}`,
+    `${code("icmpv6 * ::/0 ping6")}`,
+    "协议支持 tcp、udp、icmp、icmpv6、all；来源和名称可省略，来源默认 *。",
   );
   return lines.join("\n");
 }

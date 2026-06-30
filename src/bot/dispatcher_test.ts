@@ -89,6 +89,7 @@ class FirewallMockAdapter extends MockAdapter {
   ): Promise<FirewallRule> {
     const existing = this.rules.find((rule) => rule.name === input.name);
     const rule: FirewallRule = {
+      id: input.name ?? "rule",
       name: input.name ?? "rule",
       direction: "Inbound",
       access: "Allow",
@@ -105,11 +106,33 @@ class FirewallMockAdapter extends MockAdapter {
 
   deleteFirewallRule(
     _id: string,
-    ruleName: string,
+    ruleId: string,
     _locator?: InstanceLocator,
   ): Promise<void> {
-    this.rules = this.rules.filter((rule) => rule.name !== ruleName);
+    this.rules = this.rules.filter((rule) =>
+      rule.id !== ruleId && rule.name !== ruleId
+    );
     return Promise.resolve();
+  }
+
+  allowAllInboundTraffic(): Promise<FirewallRule[]> {
+    const existing = this.rules.find((rule) =>
+      rule.name === "debot-allow-all-inbound"
+    );
+    const rule: FirewallRule = {
+      id: "debot-allow-all-inbound",
+      name: "debot-allow-all-inbound",
+      direction: "Inbound",
+      access: "Allow",
+      protocol: "*",
+      source: "*",
+      ports: "*",
+      priority: existing?.priority ?? 1000 + this.rules.length * 10,
+      description: "DeBot allow all inbound IPv4/IPv6",
+    };
+    if (existing) Object.assign(existing, rule);
+    else this.rules.push(rule);
+    return Promise.resolve(this.rules.map((item) => ({ ...item })));
   }
 }
 
@@ -554,7 +577,7 @@ Deno.test("azure firewall rules can be added and deleted", async () => {
 
     await dispatcher.handleUpdate(callback("ls:z:x"));
     await dispatcher.handleUpdate(callback("fw:z:x:0"));
-    assert(api.lastEditText().includes("Azure 防火墙"));
+    assert(api.lastEditText().includes("防火墙入站规则"));
 
     await dispatcher.handleUpdate(callback("fw:z:x:0:add"));
     assert(api.lastSendText().includes("开放的端口规则"));
@@ -569,6 +592,15 @@ Deno.test("azure firewall rules can be added and deleted", async () => {
 
     await dispatcher.handleUpdate(callback("fw:z:x:0:delok:0"));
     assertEquals(firewall.rules.length, 0);
+
+    await dispatcher.handleUpdate(callback("fw:z:x:0:allowall"));
+    assert(api.lastEditText().includes("确认放通全部入站"));
+
+    await dispatcher.handleUpdate(callback("fw:z:x:0:allowallok"));
+    assertEquals(firewall.rules.length, 1);
+    assertEquals(firewall.rules[0].protocol, "*");
+    assertEquals(firewall.rules[0].ports, "*");
+    assertEquals(firewall.rules[0].source, "*");
   } finally {
     await cleanup(dir);
   }

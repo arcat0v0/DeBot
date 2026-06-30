@@ -12,6 +12,7 @@ export interface ListItemRef {
 }
 
 export interface FirewallRuleRef {
+  id?: string;
   name: string;
   protocol: FirewallProtocol;
   access: FirewallAccess;

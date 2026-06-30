@@ -202,6 +202,158 @@ const ROUTE_TABLE_WITH_IPV6 = `<?xml version="1.0" encoding="UTF-8"?>
   </item></routeTableSet>
 </DescribeRouteTablesResponse>`;
 
+const INSTANCE_WITH_SECURITY_GROUP = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <reservationSet><item><instancesSet><item>
+    <instanceId>i-0abc</instanceId>
+    <groupSet><item><groupId>sg-1</groupId></item></groupSet>
+    <networkInterfaceSet><item>
+      <groupSet><item><groupId>sg-1</groupId></item></groupSet>
+    </item></networkInterfaceSet>
+  </item></instancesSet></item></reservationSet>
+</DescribeInstancesResponse>`;
+
+const SECURITY_GROUP_RULES = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeSecurityGroupRulesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <securityGroupRuleSet>
+    <item>
+      <securityGroupRuleId>sgr-1</securityGroupRuleId>
+      <groupId>sg-1</groupId>
+      <isEgress>false</isEgress>
+      <ipProtocol>tcp</ipProtocol>
+      <fromPort>22</fromPort>
+      <toPort>22</toPort>
+      <cidrIpv4>0.0.0.0/0</cidrIpv4>
+      <description>ssh</description>
+    </item>
+    <item>
+      <securityGroupRuleId>sgr-2</securityGroupRuleId>
+      <groupId>sg-1</groupId>
+      <isEgress>false</isEgress>
+      <ipProtocol>-1</ipProtocol>
+      <cidrIpv6>::/0</cidrIpv6>
+      <description>all-v6</description>
+    </item>
+    <item>
+      <securityGroupRuleId>sgr-egress</securityGroupRuleId>
+      <groupId>sg-1</groupId>
+      <isEgress>true</isEgress>
+      <ipProtocol>-1</ipProtocol>
+      <cidrIpv4>0.0.0.0/0</cidrIpv4>
+    </item>
+  </securityGroupRuleSet>
+</DescribeSecurityGroupRulesResponse>`;
+
+Deno.test("Ec2Adapter lists inbound security group rules", async () => {
+  const { calls, fakeFetch } = sequenceRecorder({
+    DescribeInstances: INSTANCE_WITH_SECURITY_GROUP,
+    DescribeSecurityGroupRules: SECURITY_GROUP_RULES,
+  });
+  const adapter = adapterWith(fakeFetch);
+  const rules = await adapter.listFirewallRules("i-0abc");
+
+  assertEquals(rules.length, 2);
+  assertEquals(rules[0], {
+    id: "sgr-1",
+    name: "ssh",
+    direction: "Inbound",
+    access: "Allow",
+    protocol: "Tcp",
+    source: "0.0.0.0/0",
+    ports: "22",
+    description: "ssh",
+  });
+  assertEquals(rules[1].protocol, "*");
+  assertEquals(rules[1].source, "::/0");
+  assertEquals(rules[1].ports, "*");
+  const rulesBody = String(
+    calls.find((call) =>
+      actionFromBody(String(call.init?.body)) === "DescribeSecurityGroupRules"
+    )?.init?.body,
+  );
+  assert(rulesBody.includes("Filter.1.Name=group-id"));
+  assert(rulesBody.includes("Filter.1.Value.1=sg-1"));
+});
+
+Deno.test("Ec2Adapter adds IPv4 and IPv6 firewall rules and deletes by rule id", async () => {
+  const { calls, fakeFetch } = sequenceRecorder({
+    DescribeInstances: INSTANCE_WITH_SECURITY_GROUP,
+    AuthorizeSecurityGroupIngress: "<AuthorizeSecurityGroupIngressResponse/>",
+    RevokeSecurityGroupIngress: "<RevokeSecurityGroupIngressResponse/>",
+  });
+  const adapter = adapterWith(fakeFetch);
+  await adapter.addFirewallRule("i-0abc", {
+    name: "web",
+    protocol: "Tcp",
+    port: "443",
+    source: "*",
+    description: "web",
+  });
+  await adapter.deleteFirewallRule("i-0abc", "sgr-1");
+
+  const authorizeBodies = calls
+    .filter((call) =>
+      actionFromBody(String(call.init?.body)) ===
+        "AuthorizeSecurityGroupIngress"
+    )
+    .map((call) => String(call.init?.body));
+  assertEquals(authorizeBodies.length, 2);
+  assert(authorizeBodies[0].includes("GroupId=sg-1"));
+  assert(authorizeBodies[0].includes("IpPermissions.1.IpProtocol=tcp"));
+  assert(authorizeBodies[0].includes("IpPermissions.1.FromPort=443"));
+  assert(authorizeBodies[0].includes("IpPermissions.1.ToPort=443"));
+  assert(
+    authorizeBodies[0].includes(
+      "IpPermissions.1.IpRanges.1.CidrIp=0.0.0.0%2F0",
+    ),
+  );
+  assert(
+    authorizeBodies[1].includes(
+      "IpPermissions.1.Ipv6Ranges.1.CidrIpv6=%3A%3A%2F0",
+    ),
+  );
+  const revokeBody = String(
+    calls.find((call) =>
+      actionFromBody(String(call.init?.body)) === "RevokeSecurityGroupIngress"
+    )?.init?.body,
+  );
+  assert(!revokeBody.includes("GroupId="));
+  assert(revokeBody.includes("SecurityGroupRuleId.1=sgr-1"));
+});
+
+Deno.test("Ec2Adapter allowAllInboundTraffic opens IPv4 and IPv6 all inbound", async () => {
+  const emptyRules = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeSecurityGroupRulesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <securityGroupRuleSet/>
+</DescribeSecurityGroupRulesResponse>`;
+  const { calls, fakeFetch } = sequenceRecorder({
+    DescribeInstances: INSTANCE_WITH_SECURITY_GROUP,
+    DescribeSecurityGroupRules: emptyRules,
+    AuthorizeSecurityGroupIngress: "<AuthorizeSecurityGroupIngressResponse/>",
+  });
+  const adapter = adapterWith(fakeFetch);
+  await adapter.allowAllInboundTraffic("i-0abc");
+
+  const authorizeBodies = calls
+    .filter((call) =>
+      actionFromBody(String(call.init?.body)) ===
+        "AuthorizeSecurityGroupIngress"
+    )
+    .map((call) => String(call.init?.body));
+  assertEquals(authorizeBodies.length, 2);
+  assert(authorizeBodies[0].includes("IpPermissions.1.IpProtocol=-1"));
+  assert(
+    authorizeBodies[0].includes(
+      "IpPermissions.1.IpRanges.1.CidrIp=0.0.0.0%2F0",
+    ),
+  );
+  assert(
+    authorizeBodies[1].includes(
+      "IpPermissions.1.Ipv6Ranges.1.CidrIpv6=%3A%3A%2F0",
+    ),
+  );
+});
+
 Deno.test("Ec2Adapter addPublicIpv6 assigns an address when none exists", async () => {
   const describeInstances = `<?xml version="1.0" encoding="UTF-8"?>
 <DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">

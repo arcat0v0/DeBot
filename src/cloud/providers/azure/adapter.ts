@@ -413,6 +413,10 @@ function mapFirewallProtocol(value: string | undefined): FirewallProtocol {
   }
 }
 
+function azureSecurityRuleProtocol(protocol: FirewallProtocol): string {
+  return protocol === "Icmpv6" ? "Icmp" : protocol;
+}
+
 function mapFirewallAccess(value: string | undefined): FirewallAccess {
   return value === "Deny" ? "Deny" : "Allow";
 }
@@ -1292,7 +1296,7 @@ export class AzureAdapter implements ProviderAdapter {
           destinationPortRange: rule.port,
           direction: "Inbound",
           priority,
-          protocol: rule.protocol,
+          protocol: azureSecurityRuleProtocol(rule.protocol),
           sourceAddressPrefix: rule.source ?? "*",
           sourcePortRange: "*",
         },
@@ -1321,6 +1325,20 @@ export class AzureAdapter implements ProviderAdapter {
       NETWORK_API,
     );
     await this.pollProvisioning(nsgId, NETWORK_API);
+  }
+
+  async allowAllInboundTraffic(
+    id: string,
+    locator?: InstanceLocator,
+  ): Promise<FirewallRule[]> {
+    await this.addFirewallRule(id, {
+      name: "debot-allow-all-inbound",
+      protocol: "*",
+      port: "*",
+      source: "*",
+      description: "DeBot allow all inbound IPv4/IPv6",
+    }, locator);
+    return await this.listFirewallRules(id, locator);
   }
 
   async addPublicIpv6(id: string, locator?: InstanceLocator): Promise<string> {

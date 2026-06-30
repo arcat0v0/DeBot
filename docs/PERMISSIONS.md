@@ -46,6 +46,7 @@ button lists Wavelength Zones such as `us-east-1-wl1-bos-wlz-1`.
         "ec2:DescribeSubnets",
         "ec2:DescribeRouteTables",
         "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSecurityGroupRules",
         "ec2:DescribeCarrierGateways",
         "ec2:DescribeNetworkInterfaces",
         "ec2:StartInstances",
@@ -66,6 +67,7 @@ button lists Wavelength Zones such as `us-east-1-wl1-bos-wlz-1`.
         "ec2:CreateRoute",
         "ec2:CreateSecurityGroup",
         "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:RevokeSecurityGroupIngress",
         "ec2:CreateTags",
         "sts:GetCallerIdentity",
         "ce:GetCostAndUsage",
@@ -109,6 +111,19 @@ minimal `t3.medium` EC2 instance from the latest Amazon Linux 2023 x86_64 AMI.
 The root EBS volume is forced to `gp2` for Wavelength compatibility, and the
 network interface requests `AssociateCarrierIpAddress=true`; the returned
 instance IP is the Carrier IP when AWS provides it.
+
+**Firewall behavior**
+
+EC2 firewall management operates on the instance's attached Security Groups:
+
+- Existing inbound Security Group rules are listed, including IPv4 and IPv6 CIDR
+  sources.
+- Opening a port writes to the first attached Security Group. If the source is
+  `*`, DeBot creates both `0.0.0.0/0` and `::/0` rules.
+- One-click allow-all inbound creates all-protocol inbound rules for both
+  `0.0.0.0/0` and `::/0`.
+- Deleting a rule uses AWS `SecurityGroupRuleId` (`sgr-...`), so refresh the
+  firewall view before deleting if the rule was changed outside DeBot.
 
 ---
 
@@ -188,6 +203,8 @@ Security Group (NSG):
 
 - Existing custom inbound rules on the NIC NSG are listed.
 - Opening a port creates or updates an inbound allow rule.
+- One-click allow-all inbound creates an all-protocol, all-port inbound allow
+  rule with source `*`.
 - If the NIC has no NSG, DeBot creates `<vm-name>-nsg` and attaches it to that
   NIC. Azure's default NSG rules then deny other inbound ports unless explicit
   allow rules exist.

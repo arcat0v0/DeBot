@@ -84,17 +84,27 @@ Deno.test("AzureAdapter manages NIC-level firewall rules", async () => {
         },
       });
     }
-    if (method === "PUT" && url.pathname === `${NSG_ID}/securityRules/ssh`) {
+    if (
+      method === "PUT" && url.pathname.startsWith(`${NSG_ID}/securityRules/`)
+    ) {
+      const name = decodeURIComponent(
+        url.pathname.slice(`${NSG_ID}/securityRules/`.length),
+      );
       const rule = {
-        id: `${NSG_ID}/securityRules/ssh`,
-        name: "ssh",
+        id: `${NSG_ID}/securityRules/${name}`,
+        name,
         properties: body?.properties,
       };
-      rules.set("ssh", rule);
+      rules.set(name, rule);
       return Response.json(rule);
     }
-    if (method === "DELETE" && url.pathname === `${NSG_ID}/securityRules/ssh`) {
-      rules.delete("ssh");
+    if (
+      method === "DELETE" && url.pathname.startsWith(`${NSG_ID}/securityRules/`)
+    ) {
+      const name = decodeURIComponent(
+        url.pathname.slice(`${NSG_ID}/securityRules/`.length),
+      );
+      rules.delete(name);
       return new Response(null, { status: 204 });
     }
     return Response.json({ error: { message: `${method} ${url.pathname}` } }, {
@@ -138,6 +148,19 @@ Deno.test("AzureAdapter manages NIC-level firewall rules", async () => {
 
   await adapter.deleteFirewallRule("vm1", "ssh");
   assertEquals(await adapter.listFirewallRules("vm1"), []);
+  const opened = await adapter.allowAllInboundTraffic("vm1");
+  assertEquals(opened.map((rule) => rule.name), ["debot-allow-all-inbound"]);
+  assertEquals(rules.get("debot-allow-all-inbound")?.properties, {
+    access: "Allow",
+    description: "DeBot allow all inbound IPv4/IPv6",
+    destinationAddressPrefix: "*",
+    destinationPortRange: "*",
+    direction: "Inbound",
+    priority: 1000,
+    protocol: "*",
+    sourceAddressPrefix: "*",
+    sourcePortRange: "*",
+  });
   assert(calls.some((call) => call.method === "PUT" && call.path === NSG_ID));
 });
 

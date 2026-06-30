@@ -13,6 +13,9 @@ import type {
   AdapterContext,
   Capabilities,
   CreateInstanceInput,
+  FirewallProtocol,
+  FirewallRule,
+  FirewallRuleInput,
   Instance,
   InstanceList,
   InstanceLocator,
@@ -97,6 +100,137 @@ function isDuplicateOrAlreadyExists(error: unknown): boolean {
   const text = String(error).toLowerCase();
   return text.includes("already") || text.includes("duplicate") ||
     text.includes("routealreadyexists");
+}
+
+function mapEc2FirewallProtocol(value: string | undefined): FirewallProtocol {
+  switch (value?.toLowerCase()) {
+    case "tcp":
+    case "6":
+      return "Tcp";
+    case "udp":
+    case "17":
+      return "Udp";
+    case "icmp":
+    case "1":
+      return "Icmp";
+    case "icmpv6":
+    case "58":
+      return "Icmpv6";
+    case "-1":
+      return "*";
+    default:
+      return "*";
+  }
+}
+
+function ec2IpProtocol(protocol: FirewallProtocol): string {
+  switch (protocol) {
+    case "Tcp":
+      return "tcp";
+    case "Udp":
+      return "udp";
+    case "Icmp":
+      return "icmp";
+    case "Icmpv6":
+      return "icmpv6";
+    case "*":
+      return "-1";
+  }
+}
+
+function ec2RulePorts(
+  protocol: FirewallProtocol,
+  from: string | undefined,
+  to: string | undefined,
+): string {
+  if (protocol === "*" || !from || !to || (from === "-1" && to === "-1")) {
+    return "*";
+  }
+  return from === to ? from : `${from}-${to}`;
+}
+
+function ec2PermissionPorts(
+  protocol: FirewallProtocol,
+  port: string,
+): { from?: string; to?: string } {
+  if (protocol === "*") return {};
+  if (port === "*") {
+    if (protocol === "Tcp" || protocol === "Udp") {
+      return { from: "0", to: "65535" };
+    }
+    return { from: "-1", to: "-1" };
+  }
+  const [from, to] = port.split("-");
+  return { from, to: to ?? from };
+}
+
+function securityGroupIdsFromInstance(instance: XmlElement | undefined) {
+  const ids = new Set<string>();
+  for (const item of childElements(firstChild(instance, "groupSet"), "item")) {
+    const groupId = childText(item, "groupId");
+    if (groupId) ids.add(groupId);
+  }
+  for (
+    const networkInterface of childElements(
+      firstChild(instance, "networkInterfaceSet"),
+      "item",
+    )
+  ) {
+    for (
+      const group of childElements(
+        firstChild(networkInterface, "groupSet"),
+        "item",
+      )
+    ) {
+      const groupId = childText(group, "groupId");
+      if (groupId) ids.add(groupId);
+    }
+  }
+  return [...ids];
+}
+
+function ec2FirewallSource(rule: XmlElement): string | undefined {
+  return childText(rule, "cidrIpv4") ??
+    childText(rule, "cidrIpv6") ??
+    pathText(rule, ["referencedGroupInfo", "groupId"]) ??
+    childText(rule, "prefixListId");
+}
+
+function mapSecurityGroupRule(rule: XmlElement): FirewallRule | undefined {
+  if (childText(rule, "isEgress") === "true") return undefined;
+  const protocol = mapEc2FirewallProtocol(childText(rule, "ipProtocol"));
+  const ports = ec2RulePorts(
+    protocol,
+    childText(rule, "fromPort"),
+    childText(rule, "toPort"),
+  );
+  const id = childText(rule, "securityGroupRuleId");
+  const description = childText(rule, "description");
+  const source = ec2FirewallSource(rule);
+  return {
+    id,
+    name: description || id || `${protocol}-${ports}-${source ?? "*"}`,
+    direction: "Inbound",
+    access: "Allow",
+    protocol,
+    source,
+    ports,
+    description,
+  };
+}
+
+function ec2RuleSources(source: string | undefined): string[] {
+  const value = source?.trim() || "*";
+  if (value === "*" || value.toLowerCase() === "internet") {
+    return ["0.0.0.0/0", "::/0"];
+  }
+  if (value.includes(":") && !value.includes("/")) return [`${value}/128`];
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(value)) return [`${value}/32`];
+  return [value];
+}
+
+function isIpv6Cidr(source: string): boolean {
+  return source.includes(":");
 }
 
 function firstRouteTable(node: XmlElement | undefined): XmlElement | undefined {
@@ -207,7 +341,7 @@ export class Ec2Adapter implements ProviderAdapter {
       balance: true,
       subscriptionInfo: false,
       ipv6: true,
-      firewall: false,
+      firewall: true,
       customCreate: true,
     };
   }
@@ -309,6 +443,92 @@ export class Ec2Adapter implements ProviderAdapter {
       "Tag.1.Value": name,
     });
   }
+
+  async listFirewallRules(
+    id: string,
+    _locator?: InstanceLocator,
+  ): Promise<FirewallRule[]> {
+    const groupIds = await this.securityGroupIds(id);
+    const params: Record<string, string> = { "Filter.1.Name": "group-id" };
+    groupIds.forEach((groupId, index) => {
+      params[`Filter.1.Value.${index + 1}`] = groupId;
+    });
+    const root = await this.call("DescribeSecurityGroupRules", params);
+    const response = firstChild(root, "DescribeSecurityGroupRulesResponse");
+    return childElements(firstChild(response, "securityGroupRuleSet"), "item")
+      .map(mapSecurityGroupRule)
+      .filter((rule): rule is FirewallRule => Boolean(rule));
+  }
+
+  async addFirewallRule(
+    id: string,
+    rule: FirewallRuleInput,
+    _locator?: InstanceLocator,
+  ): Promise<FirewallRule> {
+    const [groupId] = await this.securityGroupIds(id);
+    for (const source of ec2RuleSources(rule.source)) {
+      await this.authorizeFirewallRule(groupId, rule, source);
+    }
+    return {
+      name: rule.name ?? `debot-${rule.protocol}-${rule.port}`,
+      direction: "Inbound",
+      access: "Allow",
+      protocol: rule.protocol,
+      ports: rule.port,
+      source: rule.source ?? "*",
+      description: rule.description,
+    };
+  }
+
+  async deleteFirewallRule(
+    _id: string,
+    ruleId: string,
+    _locator?: InstanceLocator,
+  ): Promise<void> {
+    if (!ruleId.startsWith("sgr-")) {
+      throw new ProviderError("aws", "security group rule id is required", {
+        userMessage:
+          "AWS 删除防火墙规则需要 SecurityGroupRuleId，请刷新规则后重试。",
+      });
+    }
+    await this.call("RevokeSecurityGroupIngress", {
+      "SecurityGroupRuleId.1": ruleId,
+    });
+  }
+
+  async allowAllInboundTraffic(
+    id: string,
+    _locator?: InstanceLocator,
+  ): Promise<FirewallRule[]> {
+    const [groupId] = await this.securityGroupIds(id);
+    const existing = await this.listFirewallRules(id);
+    const hasIpv4All = existing.some((rule) =>
+      rule.protocol === "*" && rule.ports === "*" && rule.source === "0.0.0.0/0"
+    );
+    const hasIpv6All = existing.some((rule) =>
+      rule.protocol === "*" && rule.ports === "*" && rule.source === "::/0"
+    );
+    if (!hasIpv4All) {
+      await this.authorizeFirewallRule(groupId, {
+        name: "debot-allow-all-inbound-ipv4",
+        protocol: "*",
+        port: "*",
+        source: "0.0.0.0/0",
+        description: "DeBot allow all inbound IPv4",
+      }, "0.0.0.0/0");
+    }
+    if (!hasIpv6All) {
+      await this.authorizeFirewallRule(groupId, {
+        name: "debot-allow-all-inbound-ipv6",
+        protocol: "*",
+        port: "*",
+        source: "::/0",
+        description: "DeBot allow all inbound IPv6",
+      }, "::/0");
+    }
+    return await this.listFirewallRules(id);
+  }
+
   async addPublicIpv6(id: string): Promise<string> {
     const describeRoot = await this.call("DescribeInstances", {
       "InstanceId.1": id,
@@ -460,6 +680,62 @@ export class Ec2Adapter implements ProviderAdapter {
         DestinationIpv6CidrBlock: "::/0",
         GatewayId: gatewayId,
       });
+    } catch (error) {
+      if (!isDuplicateOrAlreadyExists(error)) throw error;
+    }
+  }
+
+  private async securityGroupIds(id: string): Promise<string[]> {
+    const root = await this.call("DescribeInstances", { "InstanceId.1": id });
+    const response = firstChild(root, "DescribeInstancesResponse");
+    const reservation = firstChild(
+      firstChild(response, "reservationSet"),
+      "item",
+    );
+    const instance = firstChild(
+      firstChild(reservation, "instancesSet"),
+      "item",
+    );
+    if (!instance) throw new NotFoundError(`instance ${id} not found`);
+    const groupIds = securityGroupIdsFromInstance(instance);
+    if (groupIds.length === 0) {
+      throw new ProviderError("aws", "instance has no security groups", {
+        userMessage: "该 EC2 实例没有可管理的 Security Group。",
+      });
+    }
+    return groupIds;
+  }
+
+  private async authorizeFirewallRule(
+    groupId: string,
+    rule: FirewallRuleInput,
+    source: string,
+  ): Promise<void> {
+    const ports = ec2PermissionPorts(rule.protocol, rule.port);
+    const params: Record<string, string> = {
+      GroupId: groupId,
+      "IpPermissions.1.IpProtocol": ec2IpProtocol(rule.protocol),
+    };
+    if (ports.from !== undefined) {
+      params["IpPermissions.1.FromPort"] = ports.from;
+    }
+    if (ports.to !== undefined) {
+      params["IpPermissions.1.ToPort"] = ports.to;
+    }
+    const description = rule.name ?? rule.description;
+    if (isIpv6Cidr(source)) {
+      params["IpPermissions.1.Ipv6Ranges.1.CidrIpv6"] = source;
+      if (description) {
+        params["IpPermissions.1.Ipv6Ranges.1.Description"] = description;
+      }
+    } else {
+      params["IpPermissions.1.IpRanges.1.CidrIp"] = source;
+      if (description) {
+        params["IpPermissions.1.IpRanges.1.Description"] = description;
+      }
+    }
+    try {
+      await this.call("AuthorizeSecurityGroupIngress", params);
     } catch (error) {
       if (!isDuplicateOrAlreadyExists(error)) throw error;
     }

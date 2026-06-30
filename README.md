@@ -25,8 +25,9 @@ On Alpine (musl) install `apk add gcompat libstdc++` first. See
 - Telegram bot with inline-keyboard menus and confirmation prompts.
 - Provider-neutral instance lifecycle: list, detail, start, stop, reboot,
   delete, rename (where supported), create-from-preset and Azure manual create.
-- Azure VM firewall management through NIC-level Network Security Group inbound
-  rules.
+- Instance firewall management for AWS EC2 Security Group and Azure NIC-level
+  Network Security Group inbound rules, including IPv4/IPv6 rules and one-click
+  allow-all inbound.
 - Azure subscription helpers: student-subscription detection, balance/cost
   lookup, student-free VM region availability and a built-in low-cost student
   default VM profile with optional public IPv6.

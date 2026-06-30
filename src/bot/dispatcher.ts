@@ -164,6 +164,10 @@ function normalizeFirewallProtocol(
       return "Udp";
     case "icmp":
       return "Icmp";
+    case "icmpv6":
+    case "ipv6-icmp":
+    case "58":
+      return "Icmpv6";
     case "all":
     case "*":
       return "*";
@@ -207,7 +211,10 @@ function parseFirewallRuleInput(text: string): FirewallRuleInput {
   const firstProtocol = normalizeFirewallProtocol(tokens[0]);
   const protocol = firstProtocol ?? "Tcp";
   if (firstProtocol) tokens.shift();
-  const port = tokens.shift() ?? (protocol === "Icmp" ? "*" : "");
+  const port = tokens.shift() ??
+    (protocol === "Icmp" || protocol === "Icmpv6" || protocol === "*"
+      ? "*"
+      : "");
   if (!port) throw new Error("请填写端口，例如 tcp 22");
   validateFirewallPort(port);
   const source = tokens[0] && looksLikeFirewallSource(tokens[0])
@@ -1388,6 +1395,28 @@ export class Dispatcher {
       );
       return;
     }
+    if (action === "allowall") {
+      await this.confirmAllowAllInboundTraffic(
+        surface,
+        provider,
+        service,
+        index,
+        ref,
+        ack,
+      );
+      return;
+    }
+    if (action === "allowallok") {
+      await this.allowAllInboundTraffic(
+        user,
+        surface,
+        provider,
+        service,
+        ref,
+        ack,
+      );
+      return;
+    }
     await this.showFirewall(user, surface, provider, service, ref);
   }
 
@@ -1418,6 +1447,7 @@ export class Dispatcher {
     const index = this.indexOf(surface, provider, service, ref);
     const key = firewallKey(provider, service, ref.instanceId);
     const refs: FirewallRuleRef[] = rules.map((rule) => ({
+      id: rule.id,
       name: rule.name,
       protocol: rule.protocol,
       access: rule.access,
@@ -1428,6 +1458,9 @@ export class Dispatcher {
     this.deps.sessions.setFirewallRules(user.id, key, refs);
     const base = `fw:${pc}:${sc}:${index}`;
     const rows = [[button("➕ 开放端口", `${base}:add`)]];
+    if (adapter.allowAllInboundTraffic) {
+      rows.push([button("⚠️ 放通全部入站", `${base}:allowall`)]);
+    }
     for (let i = 0; i < Math.min(rules.length, 20); i++) {
       rows.push([button(`🗑 ${rules[i].name}`, `${base}:del:${i}`)]);
     }
@@ -1469,10 +1502,12 @@ export class Dispatcher {
       text: [
         `请发送 ${code(ref.name)} 要开放的端口规则：`,
         code("tcp 22 0.0.0.0/0 ssh"),
+        code("tcp 443 ::/0 https-v6"),
+        code("icmpv6 * ::/0 ping6"),
         "",
         "格式：协议 端口 来源 名称",
-        "来源和名称可省略，来源默认 *。",
-        "如果该网卡尚未绑定 NSG，会自动创建一个网卡级 NSG；Azure 默认会拒绝其他未允许的入站端口。",
+        "协议支持 tcp、udp、icmp、icmpv6、all；来源和名称可省略，来源默认 *。",
+        "AWS 会写入该实例绑定的 Security Group；Azure 会写入主网卡 NSG。",
       ].join("\n"),
       parse_mode: "HTML",
     });
@@ -1538,12 +1573,69 @@ export class Dispatcher {
     if (!adapter.deleteFirewallRule) {
       throw new Error("该服务商不支持删除防火墙规则");
     }
-    await adapter.deleteFirewallRule(ref.instanceId, rule.name, {
+    await adapter.deleteFirewallRule(ref.instanceId, rule.id ?? rule.name, {
       region: ref.region,
       zone: ref.zone,
       resourceGroup: ref.resourceGroup,
     });
     await ack(`已删除 ${rule.name}`);
+    await this.showFirewall(user, surface, provider, service, ref);
+  }
+
+  private async confirmAllowAllInboundTraffic(
+    surface: Surface,
+    provider: ProviderId,
+    service: string,
+    index: number,
+    ref: ListItemRef,
+    ack: (text?: string, alert?: boolean) => Promise<void>,
+  ): Promise<void> {
+    const adapter = await this.deps.cloud.getAdapter(provider, {
+      service,
+      region: ref.region,
+    });
+    if (!adapter.allowAllInboundTraffic) {
+      await ack("该服务商不支持一键放通全部入站", true);
+      return;
+    }
+    const pc = providerCode(provider);
+    const sc = serviceCode(service);
+    await this.showMenu(
+      surface,
+      [
+        bold("确认放通全部入站"),
+        "",
+        `机器：${code(ref.name)}`,
+        "这会允许所有 IPv4/IPv6 来源访问所有入站端口和协议。",
+      ].join("\n"),
+      keyboard([
+        [button("✅ 确认放通", `fw:${pc}:${sc}:${index}:allowallok`)],
+        [button("❌ 取消", `fw:${pc}:${sc}:${index}`)],
+      ]),
+    );
+  }
+
+  private async allowAllInboundTraffic(
+    user: TgUser,
+    surface: Surface,
+    provider: ProviderId,
+    service: string,
+    ref: ListItemRef,
+    ack: (text?: string, alert?: boolean) => Promise<void>,
+  ): Promise<void> {
+    const adapter = await this.deps.cloud.getAdapter(provider, {
+      service,
+      region: ref.region,
+    });
+    if (!adapter.allowAllInboundTraffic) {
+      throw new Error("该服务商不支持一键放通全部入站");
+    }
+    await adapter.allowAllInboundTraffic(ref.instanceId, {
+      region: ref.region,
+      zone: ref.zone,
+      resourceGroup: ref.resourceGroup,
+    });
+    await ack("已放通全部入站");
     await this.showFirewall(user, surface, provider, service, ref);
   }
 
