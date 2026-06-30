@@ -2,6 +2,7 @@ import { parseIdList } from "../shared/util.ts";
 import type { LogLevel } from "./logger.ts";
 
 export type BotMode = "polling" | "webhook";
+export const DEFAULT_HTTP_PORT = 18080;
 
 export interface Config {
   dataDir: string;
@@ -49,7 +50,7 @@ function parseMode(value: string | undefined): BotMode {
 export function loadConfig(): Config {
   return {
     dataDir: env("DEBOT_DATA_DIR") ?? "./data",
-    port: envInt("DEBOT_PORT", 8080),
+    port: envInt("DEBOT_PORT", DEFAULT_HTTP_PORT),
     host: env("DEBOT_HOST") ?? "0.0.0.0",
     mode: parseMode(env("DEBOT_MODE")),
     telegramToken: env("TELEGRAM_BOT_TOKEN"),

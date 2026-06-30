@@ -160,7 +160,7 @@ echo "DEBOT_MASTER_KEY=$(./dist/debot genkey)" >> .env
 ## Deployment (other)
 
 - **Docker:**
-  `docker build -t debot . && docker run --env-file .env -p 8080:8080 -v $PWD/data:/app/data debot`
+  `docker build -t debot . && docker run --env-file .env -p 18080:18080 -v $PWD/data:/app/data debot`
 - **systemd (static unit):** see [deploy/debot.service](deploy/debot.service).
 
 ## Architecture

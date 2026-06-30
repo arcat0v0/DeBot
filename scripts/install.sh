@@ -45,7 +45,7 @@ download() {
 }
 
 main() {
-  local asset url env_file token users key
+  local asset url env_file token users key host port
   asset="$(detect_asset)"
   url="https://github.com/${REPO}/releases/latest/download/${asset}"
 
@@ -83,6 +83,8 @@ main() {
     echo
     token="${TELEGRAM_BOT_TOKEN:-}"
     users="${DEBOT_ALLOWED_USERS:-}"
+    host="${DEBOT_HOST:-0.0.0.0}"
+    port="${DEBOT_PORT:-18080}"
     [ -n "$token" ] || ask "Bot Token: " token
     [ -n "$users" ] || ask "允许使用的用户 ID（逗号分隔，可留空）: " users
     [ -n "$token" ] || die "Bot Token 不能为空。"
@@ -94,6 +96,8 @@ TELEGRAM_BOT_TOKEN=$token
 DEBOT_ALLOWED_USERS=$users
 DEBOT_MASTER_KEY=$key
 DEBOT_DATA_DIR=$WORKDIR/data
+DEBOT_HOST=$host
+DEBOT_PORT=$port
 DEBOT_LOG_LEVEL=info
 EOF
     )

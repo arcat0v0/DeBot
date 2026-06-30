@@ -17,7 +17,7 @@ function fakeDispatcher(captured: TgUpdate[]): Dispatcher {
 function baseConfig(overrides: Partial<Config> = {}): Config {
   return {
     dataDir: "./data",
-    port: 8080,
+    port: 18080,
     host: "0.0.0.0",
     mode: "polling",
     allowedUsers: [1],

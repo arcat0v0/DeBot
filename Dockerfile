@@ -11,9 +11,9 @@ RUN deno cache src/main.ts \
 
 ENV DEBOT_DATA_DIR=/app/data
 ENV DEBOT_HOST=0.0.0.0
-ENV DEBOT_PORT=8080
+ENV DEBOT_PORT=18080
 
-EXPOSE 8080
+EXPOSE 18080
 USER deno
 
 CMD ["run", "--allow-net", "--allow-env", "--allow-read", "--allow-write", "src/main.ts"]
