@@ -93,6 +93,38 @@ function readIpv6Address(node: XmlElement): string | undefined {
   return undefined;
 }
 
+function isDuplicateOrAlreadyExists(error: unknown): boolean {
+  const text = String(error).toLowerCase();
+  return text.includes("already") || text.includes("duplicate") ||
+    text.includes("routealreadyexists");
+}
+
+function firstRouteTable(node: XmlElement | undefined): XmlElement | undefined {
+  return firstChild(firstChild(node, "routeTableSet"), "item");
+}
+
+function hasIpv6DefaultRoute(routeTable: XmlElement | undefined): boolean {
+  for (
+    const item of childElements(firstChild(routeTable, "routeSet"), "item")
+  ) {
+    if (childText(item, "destinationIpv6CidrBlock") === "::/0") return true;
+  }
+  return false;
+}
+
+function internetGatewayForDefaultRoute(
+  routeTable: XmlElement | undefined,
+): string | undefined {
+  for (
+    const item of childElements(firstChild(routeTable, "routeSet"), "item")
+  ) {
+    if (childText(item, "destinationCidrBlock") !== "0.0.0.0/0") continue;
+    const gatewayId = childText(item, "gatewayId");
+    if (gatewayId?.startsWith("igw-")) return gatewayId;
+  }
+  return undefined;
+}
+
 function mapInstance(node: XmlElement, region: string): Instance {
   const tags = readTags(node);
   return {
@@ -306,7 +338,6 @@ export class Ec2Adapter implements ProviderAdapter {
       });
     }
     const existingIpv6 = readIpv6Address(instance);
-    if (existingIpv6) return existingIpv6;
 
     const vpcRoot = await this.call("DescribeVpcs", { "VpcId.1": vpcId });
     const vpcResp = firstChild(vpcRoot, "DescribeVpcsResponse");
@@ -358,6 +389,9 @@ export class Ec2Adapter implements ProviderAdapter {
       });
     }
 
+    await this.ensureIpv6DefaultRoute(vpcId, subnetId);
+    if (existingIpv6) return existingIpv6;
+
     const assignRoot = await this.call("AssignIpv6Addresses", {
       NetworkInterfaceId: eniId,
       Ipv6AddressCount: "1",
@@ -381,6 +415,54 @@ export class Ec2Adapter implements ProviderAdapter {
       });
     }
     return fromEni;
+  }
+
+  private async ensureIpv6DefaultRoute(
+    vpcId: string,
+    subnetId: string,
+  ): Promise<void> {
+    const associatedRoot = await this.call("DescribeRouteTables", {
+      "Filter.1.Name": "association.subnet-id",
+      "Filter.1.Value.1": subnetId,
+    });
+    let routeTable = firstRouteTable(
+      firstChild(associatedRoot, "DescribeRouteTablesResponse"),
+    );
+    if (!routeTable) {
+      const mainRoot = await this.call("DescribeRouteTables", {
+        "Filter.1.Name": "vpc-id",
+        "Filter.1.Value.1": vpcId,
+        "Filter.2.Name": "association.main",
+        "Filter.2.Value.1": "true",
+      });
+      routeTable = firstRouteTable(
+        firstChild(mainRoot, "DescribeRouteTablesResponse"),
+      );
+    }
+    const routeTableId = childText(routeTable, "routeTableId");
+    if (!routeTable || !routeTableId) {
+      throw new ProviderError("aws", "route table not found", {
+        userMessage:
+          "IPv6 已准备，但未找到该子网的路由表，无法配置公网 IPv6 默认路由。",
+      });
+    }
+    if (hasIpv6DefaultRoute(routeTable)) return;
+    const gatewayId = internetGatewayForDefaultRoute(routeTable);
+    if (!gatewayId) {
+      throw new ProviderError("aws", "internet gateway route not found", {
+        userMessage:
+          "IPv6 已准备，但路由表没有指向 Internet Gateway 的 IPv4 默认路由，无法自动补公网 IPv6 默认路由。",
+      });
+    }
+    try {
+      await this.call("CreateRoute", {
+        RouteTableId: routeTableId,
+        DestinationIpv6CidrBlock: "::/0",
+        GatewayId: gatewayId,
+      });
+    } catch (error) {
+      if (!isDuplicateOrAlreadyExists(error)) throw error;
+    }
   }
 
   private firstIpv6Prefix(node: XmlElement | undefined): string | undefined {

@@ -174,6 +174,34 @@ function sequenceRecorder(responses: Record<string, string>) {
   return { calls, fakeFetch };
 }
 
+const ROUTE_TABLE_WITH_IGW = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeRouteTablesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <routeTableSet><item>
+    <routeTableId>rtb-1</routeTableId>
+    <routeSet><item>
+      <destinationCidrBlock>0.0.0.0/0</destinationCidrBlock>
+      <gatewayId>igw-1</gatewayId>
+    </item></routeSet>
+  </item></routeTableSet>
+</DescribeRouteTablesResponse>`;
+
+const ROUTE_TABLE_WITH_IPV6 = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeRouteTablesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <routeTableSet><item>
+    <routeTableId>rtb-1</routeTableId>
+    <routeSet>
+      <item>
+        <destinationCidrBlock>0.0.0.0/0</destinationCidrBlock>
+        <gatewayId>igw-1</gatewayId>
+      </item>
+      <item>
+        <destinationIpv6CidrBlock>::/0</destinationIpv6CidrBlock>
+        <gatewayId>igw-1</gatewayId>
+      </item>
+    </routeSet>
+  </item></routeTableSet>
+</DescribeRouteTablesResponse>`;
+
 Deno.test("Ec2Adapter addPublicIpv6 assigns an address when none exists", async () => {
   const describeInstances = `<?xml version="1.0" encoding="UTF-8"?>
 <DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
@@ -212,6 +240,8 @@ Deno.test("Ec2Adapter addPublicIpv6 assigns an address when none exists", async 
     DescribeInstances: describeInstances,
     DescribeVpcs: describeVpcs,
     DescribeSubnets: describeSubnets,
+    DescribeRouteTables: ROUTE_TABLE_WITH_IGW,
+    CreateRoute: "<CreateRouteResponse/>",
     AssignIpv6Addresses: assignIpv6,
   });
   const adapter = adapterWith(fakeFetch);
@@ -221,7 +251,16 @@ Deno.test("Ec2Adapter addPublicIpv6 assigns an address when none exists", async 
   assert(actions.includes("DescribeInstances"));
   assert(actions.includes("DescribeVpcs"));
   assert(actions.includes("DescribeSubnets"));
+  assert(actions.includes("DescribeRouteTables"));
+  assert(actions.includes("CreateRoute"));
   assert(actions.includes("AssignIpv6Addresses"));
+  const routeBody = String(
+    calls.find((c) => actionFromBody(String(c.init?.body)) === "CreateRoute")
+      ?.init?.body,
+  );
+  assert(routeBody.includes("RouteTableId=rtb-1"));
+  assert(routeBody.includes("DestinationIpv6CidrBlock=%3A%3A%2F0"));
+  assert(routeBody.includes("GatewayId=igw-1"));
   const assignBody = String(
     calls.find((c) =>
       actionFromBody(String(c.init?.body)) === "AssignIpv6Addresses"
@@ -268,6 +307,7 @@ Deno.test("Ec2Adapter addPublicIpv6 associates CIDRs when missing", async () => 
     DescribeSubnets: describeSubnets,
     AssociateVpcCidrBlock: "<AssociateVpcCidrBlockResponse/>",
     AssociateSubnetCidrBlock: "<AssociateSubnetCidrBlockResponse/>",
+    DescribeRouteTables: ROUTE_TABLE_WITH_IPV6,
     AssignIpv6Addresses: assignIpv6,
   });
   const adapter = adapterWith(fakeFetch);
@@ -276,9 +316,11 @@ Deno.test("Ec2Adapter addPublicIpv6 associates CIDRs when missing", async () => 
   const actions = calls.map((call) => actionFromBody(String(call.init?.body)));
   assert(actions.includes("AssociateSubnetCidrBlock"));
   assert(!actions.includes("AssociateVpcCidrBlock"));
+  assert(actions.includes("DescribeRouteTables"));
+  assert(!actions.includes("CreateRoute"));
 });
 
-Deno.test("Ec2Adapter addPublicIpv6 returns existing IPv6 without changes", async () => {
+Deno.test("Ec2Adapter addPublicIpv6 returns existing IPv6 after ensuring route", async () => {
   const describeInstances = `<?xml version="1.0" encoding="UTF-8"?>
 <DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
   <reservationSet><item><instancesSet><item>
@@ -293,13 +335,37 @@ Deno.test("Ec2Adapter addPublicIpv6 returns existing IPv6 without changes", asyn
     </item></networkInterfaceSet>
   </item></instancesSet></item></reservationSet>
 </DescribeInstancesResponse>`;
+  const describeVpcs = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeVpcsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <vpcSet><item>
+    <vpcId>vpc-1</vpcId>
+    <ipv6CidrBlockAssociationSet>
+      <item><ipv6CidrBlock>2600:1f16:abcd::/56</ipv6CidrBlock></item>
+    </ipv6CidrBlockAssociationSet>
+  </item></vpcSet>
+</DescribeVpcsResponse>`;
+  const describeSubnets = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeSubnetsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <subnetSet><item>
+    <subnetId>subnet-1</subnetId>
+    <ipv6CidrBlockAssociationSet>
+      <item><ipv6CidrBlock>2600:1f16:abcd::/64</ipv6CidrBlock></item>
+    </ipv6CidrBlockAssociationSet>
+  </item></subnetSet>
+</DescribeSubnetsResponse>`;
   const { calls, fakeFetch } = sequenceRecorder({
     DescribeInstances: describeInstances,
+    DescribeVpcs: describeVpcs,
+    DescribeSubnets: describeSubnets,
+    DescribeRouteTables: ROUTE_TABLE_WITH_IGW,
+    CreateRoute: "<CreateRouteResponse/>",
   });
   const adapter = adapterWith(fakeFetch);
   const address = await adapter.addPublicIpv6("i-0abc");
   assertEquals(address, "2600:1f16:abcd::existing");
-  assertEquals(calls.length, 1);
+  const actions = calls.map((call) => actionFromBody(String(call.init?.body)));
+  assert(actions.includes("CreateRoute"));
+  assert(!actions.includes("AssignIpv6Addresses"));
 });
 
 Deno.test("Ec2Adapter addPublicIpv6 reads assigned IPv6 from network interface fallback", async () => {
@@ -349,6 +415,7 @@ Deno.test("Ec2Adapter addPublicIpv6 reads assigned IPv6 from network interface f
     DescribeInstances: describeInstances,
     DescribeVpcs: describeVpcs,
     DescribeSubnets: describeSubnets,
+    DescribeRouteTables: ROUTE_TABLE_WITH_IPV6,
     AssignIpv6Addresses: assignIpv6,
     DescribeNetworkInterfaces: describeEni,
   });
