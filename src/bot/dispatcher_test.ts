@@ -13,6 +13,8 @@ import type { AdapterFactory } from "../cloud/service.ts";
 import { MockAdapter } from "../cloud/providers/mock.ts";
 import type {
   Capabilities,
+  CatalogBlueprint,
+  CatalogBundle,
   CreateInstanceInput,
   DefaultCreateOption,
   FirewallRule,
@@ -188,6 +190,27 @@ class AwsBalanceMockAdapter extends MockAdapter {
       currency: "USD",
       monthToDateCost: 4.25,
     });
+  }
+}
+
+class LightsailCatalogMockAdapter extends MockAdapter {
+  createInputs: CreateInstanceInput[] = [];
+
+  listBundles(): Promise<CatalogBundle[]> {
+    return Promise.resolve([
+      { id: "nano_3_0", name: "Nano", price: 3.5, ramSizeInGb: 0.5 },
+    ]);
+  }
+
+  listBlueprints(): Promise<CatalogBlueprint[]> {
+    return Promise.resolve([
+      { id: "ubuntu_22_04", name: "Ubuntu 22.04", platform: "LINUX_UNIX" },
+    ]);
+  }
+
+  override createInstance(input: CreateInstanceInput) {
+    this.createInputs.push(input);
+    return super.createInstance(input);
   }
 }
 
@@ -384,6 +407,98 @@ Deno.test("aws region overrides are scoped by service", async () => {
     await dispatcher.handleUpdate(callback("svc:a:e"));
     assert(api.lastEditText().includes("区域：<code>us-east-1</code>"));
     assert(!api.lastEditText().includes("us-east-1-wl1-bos-wlz-1"));
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+Deno.test("lightsail catalog create configures root ssh key and notifies when done", async () => {
+  const lightsail = new LightsailCatalogMockAdapter({
+    id: "aws",
+    label: "Mock Lightsail",
+  });
+  const { dir, api, dispatcher, profiles, jobs } = await setup(
+    [USER],
+    (provider, _credentials, options) =>
+      provider === "aws" && options.service === "lightsail"
+        ? lightsail
+        : new MockAdapter({ id: provider, label: `Mock ${provider}` }),
+  );
+  try {
+    await profiles.add({
+      name: "primary",
+      provider: "aws",
+      credentials: { accessKeyId: "a", secretAccessKey: "b" },
+    });
+
+    await dispatcher.handleUpdate(callback("lg:a:l:bp"));
+    await dispatcher.handleUpdate(callback("lg:a:l:bpsel:nano_3_0"));
+    await dispatcher.handleUpdate(
+      callback("lg:a:l:blsel:nano_3_0:ubuntu_22_04"),
+    );
+    assert(api.lastSendText().includes("root"));
+
+    await dispatcher.handleUpdate(
+      message("my-ls | ssh-ed25519 AAAATEST user@host"),
+    );
+    await jobs.idle();
+
+    assertEquals(lightsail.createInputs.length, 1);
+    assertEquals(lightsail.createInputs[0].name, "my-ls");
+    assertEquals(lightsail.createInputs[0].size, "nano_3_0");
+    assertEquals(lightsail.createInputs[0].image, "ubuntu_22_04");
+    assert(lightsail.createInputs[0].userData?.includes("/root/.ssh"));
+    assert(lightsail.createInputs[0].userData?.includes("AAAATEST"));
+    assert(
+      api.sent.some((sent) =>
+        sent.text.includes("✅ 创建 Lightsail 实例 my-ls") &&
+        sent.text.includes("已配置 root SSH 公钥")
+      ),
+    );
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+Deno.test("lightsail catalog create accepts a root password without leaking it in notifications", async () => {
+  const lightsail = new LightsailCatalogMockAdapter({
+    id: "aws",
+    label: "Mock Lightsail",
+  });
+  const { dir, api, dispatcher, profiles, jobs } = await setup(
+    [USER],
+    (provider, _credentials, options) =>
+      provider === "aws" && options.service === "lightsail"
+        ? lightsail
+        : new MockAdapter({ id: provider, label: `Mock ${provider}` }),
+  );
+  try {
+    await profiles.add({
+      name: "primary",
+      provider: "aws",
+      credentials: { accessKeyId: "a", secretAccessKey: "b" },
+    });
+
+    await dispatcher.handleUpdate(callback("lg:a:l:bp"));
+    await dispatcher.handleUpdate(callback("lg:a:l:bpsel:nano_3_0"));
+    await dispatcher.handleUpdate(
+      callback("lg:a:l:blsel:nano_3_0:ubuntu_22_04"),
+    );
+    await dispatcher.handleUpdate(message("- | S3cret!"));
+    await jobs.idle();
+
+    assertEquals(lightsail.createInputs.length, 1);
+    assert(lightsail.createInputs[0].name?.startsWith("debot-"));
+    assert(lightsail.createInputs[0].userData?.includes("root:S3cret!"));
+    assert(
+      lightsail.createInputs[0].userData?.includes(
+        "PasswordAuthentication yes",
+      ),
+    );
+    assert(!api.sent.some((sent) => sent.text.includes("S3cret!")));
+    assert(
+      api.sent.some((sent) => sent.text.includes("已配置 root 密码")),
+    );
   } finally {
     await cleanup(dir);
   }

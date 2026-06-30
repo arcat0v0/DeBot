@@ -49,8 +49,63 @@ download() {
   fi
 }
 
+install_systemd_user_service() {
+  local env_file="$1" unit_dir unit_path user_name
+  unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+  unit_path="$unit_dir/$NAME.service"
+  user_name="${USER:-${LOGNAME:-}}"
+
+  mkdir -p "$unit_dir"
+  cat >"$unit_path" <<EOF
+[Unit]
+Description=DeBot 多云运维 Telegram 机器人
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$WORKDIR
+EnvironmentFile=-$env_file
+ExecStart=$BINDIR/$NAME serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+
+  say "写入 systemd user unit：$unit_path"
+  systemctl --user daemon-reload
+  systemctl --user enable "$NAME.service"
+  systemctl --user restart "$NAME.service"
+  say "服务已重启：$NAME.service"
+
+  if [ "${DEBOT_ENABLE_LINGER:-0}" = "1" ] && [ -n "$user_name" ]; then
+    if loginctl enable-linger "$user_name" >/dev/null 2>&1; then
+      say "已启用 linger：$user_name"
+    else
+      warn "无法启用 linger；服务仍会在当前用户会话内运行。需要开机自启时可手动执行：sudo loginctl enable-linger $user_name"
+    fi
+  fi
+}
+
+install_service() {
+  local env_file="$1"
+  if command -v systemctl >/dev/null 2>&1 &&
+    systemctl --user show-environment >/dev/null 2>&1; then
+    install_systemd_user_service "$env_file"
+    return
+  fi
+
+  warn "未检测到可用的 systemd user，会回退到 debot 内置安装器。"
+  "$BINDIR/$NAME" install --name "$NAME" --workdir "$WORKDIR" --env-file "$env_file" ||
+    warn "服务安装返回非零，可手动执行：$BINDIR/$NAME install --workdir $WORKDIR --env-file $env_file"
+  "$BINDIR/$NAME" restart --name "$NAME" ||
+    warn "服务重启返回非零，可手动执行：$BINDIR/$NAME restart"
+}
+
 main() {
-  local asset url env_file token users key host port old_version new_version
+  local asset url env_file token users key host port old_version new_version cmd_name
   asset="$(detect_asset)"
   url="https://github.com/${REPO}/releases/latest/download/${asset}"
 
@@ -125,17 +180,19 @@ EOF
   fi
 
   say "安装并启动服务 …"
-  "$BINDIR/$NAME" install --name "$NAME" --workdir "$WORKDIR" --env-file "$env_file" --linger ||
-    warn "服务安装返回非零，可手动执行：$BINDIR/$NAME install --workdir $WORKDIR --env-file $env_file"
-  say "重启服务以应用当前版本 …"
-  "$BINDIR/$NAME" restart --name "$NAME" ||
-    warn "服务重启返回非零，可手动执行：$BINDIR/$NAME restart"
+  install_service "$env_file"
+
+  cmd_name="$NAME"
+  case ":$PATH:" in
+    *":$BINDIR:"*) : ;;
+    *) cmd_name="$BINDIR/$NAME" ;;
+  esac
 
   echo
   say "完成！常用命令："
-  echo "  $NAME status      # 查看状态"
-  echo "  $NAME restart     # 重启"
-  echo "  $NAME uninstall   # 卸载服务"
+  echo "  $cmd_name status      # 查看状态"
+  echo "  $cmd_name restart     # 重启"
+  echo "  $cmd_name uninstall   # 卸载服务"
   echo
   say "现在去 Telegram 给你的机器人发送 /start 即可使用。"
 }

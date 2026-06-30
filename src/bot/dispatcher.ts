@@ -85,6 +85,7 @@ const VERB_LABELS: Record<string, string> = {
 
 const AZURE_CUSTOM_CREATE_FORMAT =
   "名称 | 区域 | 资源组 | 镜像 | 规格 | SSH公钥 | IPv6";
+const LIGHTSAIL_CATALOG_CREATE_FORMAT = "实例名称 | root密码 或 root SSH公钥";
 
 const CREDENTIAL_HINTS: Record<ProviderId, string> = {
   aws: [
@@ -265,6 +266,90 @@ function parseAzureCustomCreateInput(
     size,
     sshKeyId: sshKey,
     enableIpv6: parseBooleanField(parts[6]),
+  };
+}
+
+function looksLikeSshPublicKey(value: string): boolean {
+  return /^(ssh-(rsa|ed25519)|ecdsa-sha2-|sk-ssh-)/.test(value.trim());
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replaceAll("'", "'\"'\"'")}'`;
+}
+
+function assertSingleLineSecret(value: string, label: string): void {
+  if (value.includes("\n") || value.includes("\r")) {
+    throw new ValidationError(`${label} 只能填写单行内容。`);
+  }
+}
+
+function rootPasswordUserData(password: string): string {
+  assertSingleLineSecret(password, "root 密码");
+  return [
+    "#cloud-config",
+    "disable_root: false",
+    "ssh_pwauth: true",
+    "chpasswd:",
+    "  expire: false",
+    "  list: |",
+    `    root:${password}`,
+    "runcmd:",
+    "  - mkdir -p /etc/ssh/sshd_config.d",
+    "  - printf '%s\\n' 'PermitRootLogin yes' 'PasswordAuthentication yes' > /etc/ssh/sshd_config.d/99-debot-root-login.conf",
+    "  - systemctl restart ssh || systemctl restart sshd || service ssh restart || service sshd restart",
+    "",
+  ].join("\n");
+}
+
+function rootSshKeyUserData(publicKey: string): string {
+  assertSingleLineSecret(publicKey, "root SSH 公钥");
+  return [
+    "#cloud-config",
+    "disable_root: false",
+    "runcmd:",
+    "  - mkdir -p /etc/ssh/sshd_config.d",
+    "  - printf '%s\\n' 'PermitRootLogin yes' 'PasswordAuthentication no' > /etc/ssh/sshd_config.d/99-debot-root-login.conf",
+    "  - mkdir -p /root/.ssh",
+    `  - printf '%s\\n' ${
+      shellSingleQuote(publicKey)
+    } > /root/.ssh/authorized_keys`,
+    "  - chown -R root:root /root/.ssh",
+    "  - chmod 700 /root/.ssh",
+    "  - chmod 600 /root/.ssh/authorized_keys",
+    "  - systemctl restart ssh || systemctl restart sshd || service ssh restart || service sshd restart",
+    "",
+  ].join("\n");
+}
+
+function parseLightsailCatalogCreateInput(text: string): {
+  name?: string;
+  authLabel: string;
+  userData: string;
+} {
+  const parts = text.split("|");
+  if (parts.length < 2) {
+    throw new ValidationError(
+      `请按以下格式发送：${LIGHTSAIL_CATALOG_CREATE_FORMAT}`,
+    );
+  }
+  const name = cleanField(parts.shift());
+  const auth = parts.join("|").trim();
+  if (!auth) {
+    throw new ValidationError(
+      `请按以下格式发送：${LIGHTSAIL_CATALOG_CREATE_FORMAT}`,
+    );
+  }
+  if (looksLikeSshPublicKey(auth)) {
+    return {
+      name,
+      authLabel: "root SSH 公钥",
+      userData: rootSshKeyUserData(auth),
+    };
+  }
+  return {
+    name,
+    authLabel: "root 密码",
+    userData: rootPasswordUserData(auth),
   };
 }
 
@@ -810,7 +895,7 @@ export class Dispatcher {
         }${ipText}`;
       },
       onUpdate: (record) =>
-        this.editJobMessage(surface, provider, service, label, record),
+        this.updateJobMessages(surface, provider, service, label, record, true),
     });
     await ack("创建任务已加入队列");
     this.editJobMessage(surface, provider, service, label, job);
@@ -874,7 +959,10 @@ export class Dispatcher {
       await this.deps.api.sendMessage({
         chat_id: surface.chatId,
         text: [
-          "请发送实例名称（可发送 - 使用自动命名）。",
+          "请发送实例名称和 root 登录方式：",
+          `${code("实例名称 | root密码")}`,
+          `${code("实例名称 | ssh-ed25519 AAAA... user@host")}`,
+          "名称可发送 - 使用自动命名。",
           "",
           `套餐：${code(bundleId)}`,
           `镜像：${code(blueprintId)}`,
@@ -1640,6 +1728,41 @@ export class Dispatcher {
       .catch(() => {});
   }
 
+  private updateJobMessages(
+    surface: Surface,
+    provider: ProviderId,
+    service: string,
+    label: string,
+    job: JobRecord,
+    notifyOnFinish = false,
+  ): void {
+    this.editJobMessage(surface, provider, service, label, job);
+    if (
+      notifyOnFinish &&
+      (job.status === "succeeded" || job.status === "failed")
+    ) {
+      this.sendJobFinishedMessage(surface, provider, service, label, job)
+        .catch(() => {});
+    }
+  }
+
+  private async sendJobFinishedMessage(
+    surface: Surface,
+    provider: ProviderId,
+    service: string,
+    label: string,
+    job: JobRecord,
+  ): Promise<void> {
+    const pc = providerCode(provider);
+    const sc = serviceCode(service);
+    await this.deps.api.sendMessage({
+      chat_id: surface.chatId,
+      text: this.jobStatusText(label, job),
+      parse_mode: "HTML",
+      reply_markup: keyboard([[button("📋 实例列表", `ls:${pc}:${sc}`)]]),
+    });
+  }
+
   private async enqueueDelete(
     user: TgUser,
     surface: Surface,
@@ -1811,7 +1934,7 @@ export class Dispatcher {
         return `已创建 ${instance.name}（${instance.id}）`;
       },
       onUpdate: (record) =>
-        this.editJobMessage(surface, provider, service, label, record),
+        this.updateJobMessages(surface, provider, service, label, record, true),
     });
     await ack("创建任务已加入队列");
     this.editJobMessage(surface, provider, service, label, job);
@@ -2045,7 +2168,18 @@ export class Dispatcher {
       return;
     }
     if (flow.kind === "lightsail_catalog_create") {
-      const name = text.trim() || `debot-${Date.now()}`;
+      let input: ReturnType<typeof parseLightsailCatalogCreateInput>;
+      try {
+        input = parseLightsailCatalogCreateInput(text);
+      } catch (error) {
+        await this.deps.api.sendMessage({
+          chat_id: surface.chatId,
+          text: `创建参数不正确：${escapeHtml(toUserMessage(error))}`,
+          parse_mode: "HTML",
+        });
+        return;
+      }
+      const name = input.name ?? `debot-${Date.now()}`;
       this.deps.sessions.clearFlow(user.id);
       const label = `创建 Lightsail 实例 ${name}`;
       const job = this.deps.jobs.enqueue({
@@ -2063,17 +2197,19 @@ export class Dispatcher {
             region: flow.region,
             image: flow.blueprintId,
             size: flow.bundleId,
+            userData: input.userData,
             tags: { createdBy: "DeBot", source: "lightsail-catalog" },
           });
-          return `已创建 ${instance.name}（${instance.id}）`;
+          return `已创建 ${instance.name}（${instance.id}），已配置 ${input.authLabel}`;
         },
         onUpdate: (record) =>
-          this.editJobMessage(
+          this.updateJobMessages(
             { chatId: flow.chatId, messageId: flow.messageId },
             "aws",
             flow.service,
             label,
             record,
+            true,
           ),
       });
       await this.deps.api.sendMessage({
@@ -2132,12 +2268,13 @@ export class Dispatcher {
           return `已创建 ${instance.name}（${instance.id}），区域 ${option.region}，规格 ${option.size}`;
         },
         onUpdate: (record) =>
-          this.editJobMessage(
+          this.updateJobMessages(
             { chatId: flow.chatId, messageId: flow.messageId },
             "azure",
             flow.service,
             label,
             record,
+            true,
           ),
       });
       await this.deps.api.sendMessage({
@@ -2182,12 +2319,13 @@ export class Dispatcher {
           return `已创建 ${instance.name}（${instance.id}）`;
         },
         onUpdate: (record) =>
-          this.editJobMessage(
+          this.updateJobMessages(
             { chatId: flow.chatId, messageId: flow.messageId },
             "azure",
             flow.service,
             label,
             record,
+            true,
           ),
       });
       await this.deps.api.sendMessage({
