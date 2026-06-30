@@ -61,7 +61,7 @@ Deno.test("openrcScript runs as the configured user", () => {
   assert(script.includes('command_user="deploy:deploy"'));
 });
 
-Deno.test("buildPlan systemd user writes a user unit and enables it", () => {
+Deno.test("buildPlan systemd user writes a user unit and restarts it", () => {
   const plan = buildPlan(opts(), {
     init: "systemd",
     scope: "user",
@@ -78,7 +78,12 @@ Deno.test("buildPlan systemd user writes a user unit and enables it", () => {
   );
   assert(
     plan.commands.some((c) =>
-      c.join(" ") === "systemctl --user enable --now debot.service"
+      c.join(" ") === "systemctl --user enable debot.service"
+    ),
+  );
+  assert(
+    plan.commands.some((c) =>
+      c.join(" ") === "systemctl --user restart debot.service"
     ),
   );
 });

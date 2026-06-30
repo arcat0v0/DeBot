@@ -5,10 +5,15 @@ REPO="arcat0v0/DeBot"
 NAME="debot"
 BINDIR="${DEBOT_BINDIR:-$HOME/.local/bin}"
 WORKDIR="${DEBOT_HOME:-$HOME/.config/debot}"
+TMP_DOWNLOAD=""
 
 say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m  %s\n' "$*"; }
 die() { printf '\033[1;31mxx\033[0m  %s\n' "$*" >&2; exit 1; }
+cleanup() {
+  [ -z "$TMP_DOWNLOAD" ] || rm -f "$TMP_DOWNLOAD"
+}
+trap cleanup EXIT
 
 ask() {
   local prompt="$1" __var="$2" __val=""
@@ -45,7 +50,7 @@ download() {
 }
 
 main() {
-  local asset url env_file token users key host port
+  local asset url env_file token users key host port old_version new_version
   asset="$(detect_asset)"
   url="https://github.com/${REPO}/releases/latest/download/${asset}"
 
@@ -55,9 +60,25 @@ main() {
 
   say "下载 ${asset} …"
   mkdir -p "$BINDIR" "$WORKDIR/data"
-  download "$url" "$BINDIR/$NAME"
-  chmod +x "$BINDIR/$NAME"
+  if [ -x "$BINDIR/$NAME" ]; then
+    old_version="$("$BINDIR/$NAME" version 2>/dev/null || true)"
+  else
+    old_version=""
+  fi
+  TMP_DOWNLOAD="$(mktemp "$BINDIR/.${NAME}.download.XXXXXX")"
+  download "$url" "$TMP_DOWNLOAD"
+  chmod 0755 "$TMP_DOWNLOAD"
+  new_version="$("$TMP_DOWNLOAD" version 2>/dev/null || true)"
+  [ -n "$new_version" ] ||
+    die "下载的二进制无法运行（若为 Alpine 请先安装 gcompat libstdc++）。"
+  mv -f "$TMP_DOWNLOAD" "$BINDIR/$NAME"
+  TMP_DOWNLOAD=""
   say "已安装二进制：$BINDIR/$NAME"
+  if [ -n "$old_version" ] && [ "$old_version" != "$new_version" ]; then
+    say "版本更新：$old_version -> $new_version"
+  else
+    say "当前版本：$new_version"
+  fi
 
   case ":$PATH:" in
     *":$BINDIR:"*) : ;;
@@ -66,9 +87,6 @@ main() {
       warn "  echo 'export PATH=\"$BINDIR:\$PATH\"' >> ~/.bashrc && source ~/.bashrc"
       ;;
   esac
-
-  "$BINDIR/$NAME" version >/dev/null 2>&1 ||
-    die "二进制无法运行（若为 Alpine 请先安装 gcompat libstdc++）。"
 
   env_file="$WORKDIR/config.env"
   if [ -f "$env_file" ]; then
@@ -109,6 +127,9 @@ EOF
   say "安装并启动服务 …"
   "$BINDIR/$NAME" install --name "$NAME" --workdir "$WORKDIR" --env-file "$env_file" --linger ||
     warn "服务安装返回非零，可手动执行：$BINDIR/$NAME install --workdir $WORKDIR --env-file $env_file"
+  say "重启服务以应用当前版本 …"
+  "$BINDIR/$NAME" restart --name "$NAME" ||
+    warn "服务重启返回非零，可手动执行：$BINDIR/$NAME restart"
 
   echo
   say "完成！常用命令："

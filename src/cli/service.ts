@@ -140,11 +140,10 @@ export function buildPlan(
     if (params.linger && params.scope === "user") {
       commands.push(["loginctl", "enable-linger", opts.user]);
     }
-    commands.push(
-      params.start
-        ? [...ctl, "enable", "--now", `${opts.name}.service`]
-        : [...ctl, "enable", `${opts.name}.service`],
-    );
+    commands.push([...ctl, "enable", `${opts.name}.service`]);
+    if (params.start) {
+      commands.push([...ctl, "restart", `${opts.name}.service`]);
+    }
     return {
       init: "systemd",
       scope: params.scope,
