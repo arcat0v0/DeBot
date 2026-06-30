@@ -13,7 +13,7 @@ import {
   type ServiceOptions,
 } from "./cli/service.ts";
 
-const VERSION = "0.2.3";
+const VERSION = "0.2.4";
 
 const HELP = `DeBot ${VERSION} — 自托管多云运维机器人
 
