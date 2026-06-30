@@ -14,7 +14,9 @@ import type {
   InstanceState,
   ListOptions,
   ProviderAdapter,
+  SubscriptionBalance,
 } from "../../types.ts";
+import { AwsBillingClient } from "./billing.ts";
 import { signedFetch } from "./client.ts";
 
 const TARGET_PREFIX = "Lightsail_20161128";
@@ -70,11 +72,13 @@ export class LightsailAdapter implements ProviderAdapter {
   private readonly region: string;
   private readonly fetchImpl: FetchLike;
   private readonly credentials: AdapterContext<"aws">["credentials"];
+  private readonly billing: AwsBillingClient;
 
   constructor(ctx: AdapterContext<"aws">) {
     this.fetchImpl = ctx.fetch ?? fetch;
     this.region = ctx.defaultRegion ?? "us-east-1";
     this.credentials = ctx.credentials;
+    this.billing = new AwsBillingClient(ctx);
   }
 
   private async call<T>(operation: string, payload: unknown = {}): Promise<T> {
@@ -114,12 +118,16 @@ export class LightsailAdapter implements ProviderAdapter {
       rename: false,
       regions: true,
       regionAvailability: false,
-      balance: false,
+      balance: true,
       subscriptionInfo: false,
       ipv6: false,
       firewall: false,
       customCreate: true,
     };
+  }
+
+  getSubscriptionBalance(): Promise<SubscriptionBalance> {
+    return this.billing.getSubscriptionBalance();
   }
 
   async listRegions(): Promise<string[]> {

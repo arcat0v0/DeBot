@@ -10,7 +10,7 @@ described below. You may paste JSON or the short space-separated form.
 
 ---
 
-## AWS (EC2 and Lightsail)
+## AWS (EC2, Lightsail, Wavelength)
 
 **Credential input**
 
@@ -25,7 +25,8 @@ or JSON:
 ```
 
 The region you set becomes the default the bot operates in. Change it later from
-the service menu's **Region** button.
+the service menu's **Region** button. For the AWS Wavelength service, the Region
+button lists Wavelength Zones such as `us-east-1-wl1-bos-wlz-1`.
 
 **IAM policy (least privilege)**
 
@@ -37,13 +38,33 @@ the service menu's **Region** button.
       "Effect": "Allow",
       "Action": [
         "ec2:DescribeInstances",
+        "ec2:DescribeAvailabilityZones",
+        "ec2:DescribeImages",
+        "ec2:DescribeInstanceTypeOfferings",
         "ec2:DescribeRegions",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeSubnets",
+        "ec2:DescribeRouteTables",
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeCarrierGateways",
         "ec2:StartInstances",
         "ec2:StopInstances",
         "ec2:RebootInstances",
         "ec2:TerminateInstances",
         "ec2:RunInstances",
+        "ec2:ModifyAvailabilityZoneGroup",
+        "ec2:CreateVpc",
+        "ec2:ModifyVpcAttribute",
+        "ec2:CreateSubnet",
+        "ec2:CreateCarrierGateway",
+        "ec2:CreateRouteTable",
+        "ec2:AssociateRouteTable",
+        "ec2:CreateRoute",
+        "ec2:CreateSecurityGroup",
+        "ec2:AuthorizeSecurityGroupIngress",
         "ec2:CreateTags",
+        "sts:GetCallerIdentity",
+        "ce:GetCostAndUsage",
         "lightsail:GetInstances",
         "lightsail:GetInstance",
         "lightsail:GetRegions",
@@ -66,6 +87,24 @@ the service menu's **Region** button.
 - Lightsail `image` is a blueprint id (`ubuntu_22_04`), `size` is a bundle id
   (`nano_3_0`), `sshKeyId` is a Lightsail key-pair name; `zone` is an
   availability zone (`us-east-1a`).
+
+**Balance / cost**
+
+AWS does not expose a universal prepaid "balance" for every account type. DeBot
+shows the AWS account ID through STS and, when Cost Explorer is enabled and the
+IAM user has `ce:GetCostAndUsage`, the month-to-date unblended cost. If Cost
+Explorer is disabled or denied, the bot keeps the account ID and displays a
+permission warning.
+
+**Wavelength minimal instance**
+
+The built-in Wavelength create action chooses the selected Wavelength Zone, opts
+the zone group in when needed, creates/reuses a DeBot-tagged VPC, Carrier
+Gateway, Wavelength subnet, route table and SSH security group, then launches a
+minimal `t3.medium` EC2 instance from the latest Amazon Linux 2023 x86_64 AMI.
+The root EBS volume is forced to `gp2` for Wavelength compatibility, and the
+network interface requests `AssociateCarrierIpAddress=true`; the returned
+instance IP is the Carrier IP when AWS provides it.
 
 ---
 

@@ -5,8 +5,8 @@ Deno and TypeScript. It reproduces the useful instance-lifecycle controls of
 R-Bot without paid gating and without the heavier web-panel / Web SSH surfaces.
 
 You add cloud credentials through a private Telegram chat, then list and control
-instances across **AWS (EC2 + Lightsail)**, **Azure**, **Google Cloud** and
-**DigitalOcean** from inline keyboards.
+instances across **AWS (EC2 + Lightsail + Wavelength)**, **Azure**, **Google
+Cloud** and **DigitalOcean** from inline keyboards.
 
 ## One-line install (Linux)
 
@@ -30,9 +30,12 @@ On Alpine (musl) install `apk add gcompat libstdc++` first. See
 - Azure subscription helpers: student-subscription detection, balance/cost
   lookup, student-free VM region availability and a built-in low-cost student
   default VM profile with optional public IPv6.
+- AWS account/cost helper through STS and Cost Explorer, plus built-in
+  Wavelength minimal instance creation with Carrier IP assignment.
 - Four providers via direct REST APIs (no heavyweight SDKs):
   - **AWS EC2** — SigV4-signed Query API.
   - **AWS Lightsail** — SigV4-signed JSON API.
+  - **AWS Wavelength** — EC2 Query API with Carrier Gateway/Subnet bootstrap.
   - **Azure** — virtual machines over the ARM REST API.
   - **Google Cloud** — Compute Engine over REST with service-account JWT auth.
   - **DigitalOcean** — droplets over the v2 REST API.

@@ -274,7 +274,7 @@ function formatAmount(amount: number | undefined, currency?: string): string {
 
 function shouldAckCallbackBeforeRoute(data: string): boolean {
   const head = data.split(":", 1)[0];
-  return head === "az" || head === "rg";
+  return head === "az" || head === "aw" || head === "rg";
 }
 
 function subscriptionInfoText(info: SubscriptionInfo): string {
@@ -291,9 +291,12 @@ function subscriptionInfoText(info: SubscriptionInfo): string {
   return lines.join("\n");
 }
 
-function subscriptionBalanceText(balance: SubscriptionBalance): string {
-  const lines = [bold("Azure 订阅余额")];
-  lines.push(`订阅 ID：${code(balance.subscriptionId)}`);
+function subscriptionBalanceText(
+  provider: ProviderId,
+  balance: SubscriptionBalance,
+): string {
+  const lines = [bold(`${PROVIDER_LABELS[provider]} 余额/成本`)];
+  lines.push(`账号/订阅 ID：${code(balance.subscriptionId)}`);
   if (balance.credit?.length) {
     lines.push("");
     lines.push("信用余额：");
@@ -550,6 +553,7 @@ export class Dispatcher {
           user.id,
           decodeProvider(parts[1]),
           parts.slice(3).join(":"),
+          decodeService(parts[2]),
         );
         await ack(`区域已设为 ${parts.slice(3).join(":")}`);
         await this.showService(
@@ -566,6 +570,9 @@ export class Dispatcher {
         return;
       case "az":
         await this.handleAzureCallback(user, surface, parts, ack);
+        return;
+      case "aw":
+        await this.handleAwsCallback(user, surface, parts, ack);
         return;
       case "cr":
         await this.showCreateMenu(
@@ -628,16 +635,38 @@ export class Dispatcher {
   ): Promise<void> {
     const provider = decodeProvider(parts[1]);
     const service = decodeService(parts[2]);
-    if (provider !== "azure") throw new Error("该操作仅支持 Azure");
     const action = parts[3];
     const pc = providerCode(provider);
     const sc = serviceCode(service);
     const profile = await this.deps.profiles.getActive(provider);
-    const region = this.regionFor(surface, provider, profile?.defaultRegion);
+    const region = this.regionFor(
+      surface,
+      provider,
+      profile?.defaultRegion,
+      service,
+    );
     const adapter = await this.deps.cloud.getAdapter(provider, {
       service,
       region,
     });
+
+    if (action === "bal") {
+      if (!adapter.getSubscriptionBalance) {
+        throw new Error("该服务商不支持查询余额");
+      }
+      const balance = await adapter.getSubscriptionBalance();
+      await this.showMenu(
+        surface,
+        subscriptionBalanceText(provider, balance),
+        keyboard([
+          [button("🔄 刷新", `az:${pc}:${sc}:bal`)],
+          [button("⬅️ 返回", `svc:${pc}:${sc}`)],
+        ]),
+      );
+      return;
+    }
+
+    if (provider !== "azure") throw new Error("该操作仅支持 Azure");
 
     if (action === "sub") {
       if (!adapter.getSubscriptionInfo) {
@@ -649,22 +678,6 @@ export class Dispatcher {
         subscriptionInfoText(info),
         keyboard([
           [button("🔄 刷新", `az:${pc}:${sc}:sub`)],
-          [button("⬅️ 返回", `svc:${pc}:${sc}`)],
-        ]),
-      );
-      return;
-    }
-
-    if (action === "bal") {
-      if (!adapter.getSubscriptionBalance) {
-        throw new Error("该服务商不支持查询订阅余额");
-      }
-      const balance = await adapter.getSubscriptionBalance();
-      await this.showMenu(
-        surface,
-        subscriptionBalanceText(balance),
-        keyboard([
-          [button("🔄 刷新", `az:${pc}:${sc}:bal`)],
           [button("⬅️ 返回", `svc:${pc}:${sc}`)],
         ]),
       );
@@ -739,6 +752,72 @@ export class Dispatcher {
     await this.showService(surface, provider, service);
   }
 
+  private async handleAwsCallback(
+    user: TgUser,
+    surface: Surface,
+    parts: string[],
+    ack: (text?: string, alert?: boolean) => Promise<void>,
+  ): Promise<void> {
+    const provider = decodeProvider(parts[1]);
+    const service = decodeService(parts[2]);
+    if (provider !== "aws" || service !== "wavelength") {
+      throw new Error("该操作仅支持 AWS Wavelength");
+    }
+    const action = parts[3];
+    if (action !== "create") {
+      await this.showService(surface, provider, service);
+      return;
+    }
+
+    const pc = providerCode(provider);
+    const sc = serviceCode(service);
+    const profile = await this.deps.profiles.getActive(provider);
+    const region = this.regionFor(
+      surface,
+      provider,
+      profile?.defaultRegion,
+      service,
+    );
+    const label = "创建 AWS Wavelength 最小机器";
+    const job = this.deps.jobs.enqueue({
+      kind: "create",
+      label,
+      provider,
+      userId: user.id,
+      run: async () => {
+        const adapter = await this.deps.cloud.getAdapter(provider, {
+          service,
+          region,
+        });
+        const instance = await adapter.createInstance({
+          name: `debot-wl-${Date.now()}`,
+          region,
+          zone: region,
+          image: "auto",
+          size: "auto",
+          tags: { createdBy: "DeBot", preset: "wavelength-minimal" },
+        });
+        const ipText = instance.publicIp
+          ? `，Carrier IP ${instance.publicIp}`
+          : "，暂未返回 Carrier IP，请稍后刷新实例详情";
+        return `已创建 ${instance.name}（${instance.id}），Zone ${
+          instance.zone ?? region ?? "auto"
+        }${ipText}`;
+      },
+      onUpdate: (record) =>
+        this.editJobMessage(surface, provider, service, label, record),
+    });
+    await ack("创建任务已加入队列");
+    this.editJobMessage(surface, provider, service, label, job);
+    if (!surface.messageId) {
+      await this.showMenu(
+        surface,
+        this.jobStatusText(label, job),
+        keyboard([[button("📋 实例列表", `ls:${pc}:${sc}`)]]),
+      );
+    }
+  }
+
   private async showHelp(surface: Surface): Promise<void> {
     const text = [
       bold("DeBot 帮助"),
@@ -808,7 +887,12 @@ export class Dispatcher {
       return;
     }
 
-    const region = this.regionFor(surface, provider, profile.defaultRegion);
+    const region = this.regionFor(
+      surface,
+      provider,
+      profile.defaultRegion,
+      service,
+    );
     const adapter = await this.deps.cloud.getAdapter(provider, {
       service,
       region,
@@ -846,9 +930,10 @@ export class Dispatcher {
     surface: Surface,
     provider: ProviderId,
     fallback?: string,
+    service?: string,
   ): string | undefined {
     const userId = surface.chatId;
-    return this.deps.sessions.getRegion(userId, provider) ?? fallback;
+    return this.deps.sessions.getRegion(userId, provider, service) ?? fallback;
   }
 
   private async showRegions(
@@ -892,7 +977,7 @@ export class Dispatcher {
     provider: ProviderId,
     service: string,
   ): Promise<void> {
-    const region = this.regionFor(surface, provider);
+    const region = this.regionFor(surface, provider, undefined, service);
     const adapter = await this.deps.cloud.getAdapter(provider, {
       service,
       region,
@@ -1478,6 +1563,15 @@ export class Dispatcher {
       ]);
       rows.push([button("✍️ 手动填写创建", `az:${pc}:${sc}:custom`)]);
     }
+    if (provider === "aws" && service === "wavelength") {
+      lines.push(
+        "",
+        "Wavelength 会在所选 Zone 创建最小 EC2 机器并关联 Carrier IP。",
+      );
+      rows.push([
+        button("📡 Wavelength 最小机器", `aw:${pc}:${sc}:create`),
+      ]);
+    }
     if (presets.length === 0) {
       lines.push("", `还没有 ${PROVIDER_LABELS[provider]} 预设。`);
     } else {
@@ -1511,7 +1605,7 @@ export class Dispatcher {
     }
     const label = `创建 ${preset.name}`;
     const region = preset.region ??
-      this.deps.sessions.getRegion(user.id, provider);
+      this.deps.sessions.getRegion(user.id, provider, service);
     const job = this.deps.jobs.enqueue({
       kind: "create",
       label,

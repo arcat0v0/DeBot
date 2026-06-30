@@ -174,6 +174,23 @@ class AzureFeatureMockAdapter extends MockAdapter {
   }
 }
 
+class AwsBalanceMockAdapter extends MockAdapter {
+  override capabilities(): Capabilities {
+    return {
+      ...super.capabilities(),
+      balance: true,
+    };
+  }
+
+  getSubscriptionBalance(): Promise<SubscriptionBalance> {
+    return Promise.resolve({
+      subscriptionId: "123456789012",
+      currency: "USD",
+      monthToDateCost: 4.25,
+    });
+  }
+}
+
 class SlowAzureSubscriptionMockAdapter extends AzureFeatureMockAdapter {
   gate: Promise<void> = Promise.resolve();
 
@@ -314,6 +331,59 @@ Deno.test("listing and stopping an instance works end to end", async () => {
       "expected a stop acknowledgement",
     );
     assert(api.lastEditText().includes("已停止"));
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+Deno.test("aws balance callback shows AWS cost information", async () => {
+  const aws = new AwsBalanceMockAdapter({
+    id: "aws",
+    label: "Mock AWS",
+  });
+  const { dir, api, dispatcher, profiles } = await setup(
+    [USER],
+    (provider) =>
+      provider === "aws"
+        ? aws
+        : new MockAdapter({ id: provider, label: `Mock ${provider}` }),
+  );
+  try {
+    await profiles.add({
+      name: "primary",
+      provider: "aws",
+      credentials: { accessKeyId: "a", secretAccessKey: "b" },
+    });
+
+    await dispatcher.handleUpdate(callback("svc:a:e"));
+    assert(
+      JSON.stringify(api.edits.at(-1)?.reply_markup).includes("订阅余额"),
+    );
+
+    await dispatcher.handleUpdate(callback("az:a:e:bal"));
+    assert(api.lastEditText().includes("AWS 余额/成本"));
+    assert(api.lastEditText().includes("4.2500 USD"));
+  } finally {
+    await cleanup(dir);
+  }
+});
+
+Deno.test("aws region overrides are scoped by service", async () => {
+  const { dir, api, dispatcher, profiles } = await setup();
+  try {
+    await profiles.add({
+      name: "primary",
+      provider: "aws",
+      defaultRegion: "us-east-1",
+      credentials: { accessKeyId: "a", secretAccessKey: "b" },
+    });
+
+    await dispatcher.handleUpdate(callback("rgs:a:w:us-east-1-wl1-bos-wlz-1"));
+    assert(api.lastEditText().includes("us-east-1-wl1-bos-wlz-1"));
+
+    await dispatcher.handleUpdate(callback("svc:a:e"));
+    assert(api.lastEditText().includes("区域：<code>us-east-1</code>"));
+    assert(!api.lastEditText().includes("us-east-1-wl1-bos-wlz-1"));
   } finally {
     await cleanup(dir);
   }

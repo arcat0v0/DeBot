@@ -70,6 +70,36 @@ Deno.test("Ec2Adapter lists and maps instances", async () => {
   assert(String(calls[0].init?.body).includes("Action=DescribeInstances"));
 });
 
+Deno.test("Ec2Adapter maps Wavelength carrier IP addresses", async () => {
+  const xml = `<?xml version="1.0" encoding="UTF-8"?>
+  <DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+    <reservationSet>
+      <item>
+        <instancesSet>
+          <item>
+            <instanceId>i-wl</instanceId>
+            <instanceType>t3.medium</instanceType>
+            <imageId>ami-123</imageId>
+            <instanceState><name>running</name></instanceState>
+            <privateIpAddress>10.64.1.10</privateIpAddress>
+            <placement><availabilityZone>us-east-1-wl1-bos-wlz-1</availabilityZone></placement>
+            <networkInterfaceSet>
+              <item>
+                <association><carrierIp>155.146.10.20</carrierIp></association>
+              </item>
+            </networkInterfaceSet>
+          </item>
+        </instancesSet>
+      </item>
+    </reservationSet>
+  </DescribeInstancesResponse>`;
+  const { fakeFetch } = recorder(xml);
+  const adapter = adapterWith(fakeFetch);
+  const list = await adapter.listInstances();
+
+  assertEquals(list.instances[0].publicIp, "155.146.10.20");
+});
+
 Deno.test("Ec2Adapter issues signed start requests", async () => {
   const ok =
     `<StartInstancesResponse xmlns="x"><instancesSet/></StartInstancesResponse>`;

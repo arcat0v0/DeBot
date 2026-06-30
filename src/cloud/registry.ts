@@ -10,6 +10,7 @@ import type {
 } from "./types.ts";
 import { Ec2Adapter } from "./providers/aws/ec2.ts";
 import { LightsailAdapter } from "./providers/aws/lightsail.ts";
+import { WavelengthAdapter } from "./providers/aws/wavelength.ts";
 import { AzureAdapter } from "./providers/azure/adapter.ts";
 import { GcpAdapter } from "./providers/gcp/adapter.ts";
 import { DigitalOceanAdapter } from "./providers/digitalocean/adapter.ts";
@@ -25,6 +26,7 @@ export function providerServices(provider: ProviderId): ProviderService[] {
     return [
       { id: "ec2", label: "EC2" },
       { id: "lightsail", label: "Lightsail" },
+      { id: "wavelength", label: "Wavelength" },
     ];
   }
   return [{ id: "default", label: "实例" }];
@@ -49,9 +51,9 @@ export function createAdapter(
         defaultRegion: options.defaultRegion,
         fetch: fetchImpl,
       };
-      return options.service === "lightsail"
-        ? new LightsailAdapter(ctx)
-        : new Ec2Adapter(ctx);
+      if (options.service === "lightsail") return new LightsailAdapter(ctx);
+      if (options.service === "wavelength") return new WavelengthAdapter(ctx);
+      return new Ec2Adapter(ctx);
     }
     case "azure":
       return new AzureAdapter({

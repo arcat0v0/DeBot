@@ -19,7 +19,9 @@ import type {
   InstanceState,
   ListOptions,
   ProviderAdapter,
+  SubscriptionBalance,
 } from "../../types.ts";
+import { AwsBillingClient } from "./billing.ts";
 import { signedFetch } from "./client.ts";
 
 const VERSION = "2016-11-15";
@@ -52,6 +54,15 @@ function readTags(node: XmlElement | undefined): Record<string, string> {
   return tags;
 }
 
+function readCarrierIp(node: XmlElement): string | undefined {
+  const interfaces = firstChild(node, "networkInterfaceSet");
+  for (const item of childElements(interfaces, "item")) {
+    const carrierIp = pathText(item, ["association", "carrierIp"]);
+    if (carrierIp) return carrierIp;
+  }
+  return undefined;
+}
+
 function mapInstance(node: XmlElement, region: string): Instance {
   const tags = readTags(node);
   return {
@@ -62,7 +73,7 @@ function mapInstance(node: XmlElement, region: string): Instance {
     zone: pathText(node, ["placement", "availabilityZone"]),
     size: childText(node, "instanceType"),
     image: childText(node, "imageId"),
-    publicIp: childText(node, "ipAddress"),
+    publicIp: childText(node, "ipAddress") ?? readCarrierIp(node),
     privateIp: childText(node, "privateIpAddress"),
     createdAt: childText(node, "launchTime"),
     tags: Object.keys(tags).length > 0 ? tags : undefined,
@@ -75,11 +86,13 @@ export class Ec2Adapter implements ProviderAdapter {
   private readonly region: string;
   private readonly fetchImpl: FetchLike;
   private readonly credentials: AdapterContext<"aws">["credentials"];
+  private readonly billing: AwsBillingClient;
 
   constructor(ctx: AdapterContext<"aws">) {
     this.fetchImpl = ctx.fetch ?? fetch;
     this.region = ctx.defaultRegion ?? "us-east-1";
     this.credentials = ctx.credentials;
+    this.billing = new AwsBillingClient(ctx);
   }
 
   private async call(
@@ -128,12 +141,16 @@ export class Ec2Adapter implements ProviderAdapter {
       rename: true,
       regions: true,
       regionAvailability: false,
-      balance: false,
+      balance: true,
       subscriptionInfo: false,
       ipv6: false,
       firewall: false,
       customCreate: true,
     };
+  }
+
+  getSubscriptionBalance(): Promise<SubscriptionBalance> {
+    return this.billing.getSubscriptionBalance();
   }
 
   async listRegions(): Promise<string[]> {

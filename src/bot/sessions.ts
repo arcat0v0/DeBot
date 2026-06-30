@@ -67,7 +67,7 @@ export interface Session {
   flow?: Flow;
   lists: Map<string, ListItemRef[]>;
   firewallRules: Map<string, FirewallRuleRef[]>;
-  regionOverride: Partial<Record<ProviderId, string>>;
+  regionOverride: Record<string, string>;
 }
 
 export class SessionStore {
@@ -123,11 +123,26 @@ export class SessionStore {
     return this.get(userId).firewallRules.get(key)?.[index];
   }
 
-  setRegion(userId: number, provider: ProviderId, region: string): void {
-    this.get(userId).regionOverride[provider] = region;
+  private regionKey(provider: ProviderId, service?: string): string {
+    return service ? `${provider}:${service}` : provider;
   }
 
-  getRegion(userId: number, provider: ProviderId): string | undefined {
-    return this.get(userId).regionOverride[provider];
+  setRegion(
+    userId: number,
+    provider: ProviderId,
+    region: string,
+    service?: string,
+  ): void {
+    this.get(userId).regionOverride[this.regionKey(provider, service)] = region;
+  }
+
+  getRegion(
+    userId: number,
+    provider: ProviderId,
+    service?: string,
+  ): string | undefined {
+    const session = this.get(userId);
+    return session.regionOverride[this.regionKey(provider, service)] ??
+      session.regionOverride[this.regionKey(provider)];
   }
 }

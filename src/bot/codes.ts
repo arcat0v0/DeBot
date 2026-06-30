@@ -17,12 +17,14 @@ const CODE_TO_PROVIDER: Record<string, ProviderId> = {
 const SERVICE_TO_CODE: Record<string, string> = {
   ec2: "e",
   lightsail: "l",
+  wavelength: "w",
   default: "x",
 };
 
 const CODE_TO_SERVICE: Record<string, string> = {
   e: "ec2",
   l: "lightsail",
+  w: "wavelength",
   x: "default",
 };
 
