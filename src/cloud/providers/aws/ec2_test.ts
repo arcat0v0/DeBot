@@ -15,6 +15,13 @@ const LIST_XML = `<?xml version="1.0" encoding="UTF-8"?>
           <privateIpAddress>10.0.0.7</privateIpAddress>
           <ipAddress>54.0.0.7</ipAddress>
           <placement><availabilityZone>us-east-1a</availabilityZone></placement>
+          <networkInterfaceSet>
+            <item>
+              <ipv6AddressesSet>
+                <item><ipv6Address>2600:1f18:abcd::7</ipv6Address></item>
+              </ipv6AddressesSet>
+            </item>
+          </networkInterfaceSet>
           <launchTime>2024-05-01T00:00:00.000Z</launchTime>
           <tagSet><item><key>Name</key><value>api</value></item></tagSet>
         </item>
@@ -62,6 +69,7 @@ Deno.test("Ec2Adapter lists and maps instances", async () => {
   assertEquals(instance.state, "running");
   assertEquals(instance.zone, "us-east-1a");
   assertEquals(instance.publicIp, "54.0.0.7");
+  assertEquals(instance.publicIpv6, "2600:1f18:abcd::7");
 
   assertEquals(calls.length, 1);
   assertEquals(calls[0].url, "https://ec2.us-east-1.amazonaws.com/");
@@ -279,7 +287,9 @@ Deno.test("Ec2Adapter addPublicIpv6 returns existing IPv6 without changes", asyn
       <networkInterfaceId>eni-1</networkInterfaceId>
       <vpcId>vpc-1</vpcId>
       <subnetId>subnet-1</subnetId>
-      <ipv6sSet><item>2600:1f16:abcd::existing</item></ipv6sSet>
+      <ipv6AddressesSet>
+        <item><ipv6Address>2600:1f16:abcd::existing</ipv6Address></item>
+      </ipv6AddressesSet>
     </item></networkInterfaceSet>
   </item></instancesSet></item></reservationSet>
 </DescribeInstancesResponse>`;
@@ -290,4 +300,61 @@ Deno.test("Ec2Adapter addPublicIpv6 returns existing IPv6 without changes", asyn
   const address = await adapter.addPublicIpv6("i-0abc");
   assertEquals(address, "2600:1f16:abcd::existing");
   assertEquals(calls.length, 1);
+});
+
+Deno.test("Ec2Adapter addPublicIpv6 reads assigned IPv6 from network interface fallback", async () => {
+  const describeInstances = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <reservationSet><item><instancesSet><item>
+    <instanceId>i-0abc</instanceId>
+    <networkInterfaceSet><item>
+      <networkInterfaceId>eni-1</networkInterfaceId>
+      <vpcId>vpc-1</vpcId>
+      <subnetId>subnet-1</subnetId>
+    </item></networkInterfaceSet>
+  </item></instancesSet></item></reservationSet>
+</DescribeInstancesResponse>`;
+  const describeVpcs = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeVpcsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <vpcSet><item>
+    <vpcId>vpc-1</vpcId>
+    <ipv6CidrBlockAssociationSet>
+      <item><ipv6CidrBlock>2600:1f16:abcd::/56</ipv6CidrBlock></item>
+    </ipv6CidrBlockAssociationSet>
+  </item></vpcSet>
+</DescribeVpcsResponse>`;
+  const describeSubnets = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeSubnetsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <subnetSet><item>
+    <subnetId>subnet-1</subnetId>
+    <ipv6CidrBlockAssociationSet>
+      <item><ipv6CidrBlock>2600:1f16:abcd::/64</ipv6CidrBlock></item>
+    </ipv6CidrBlockAssociationSet>
+  </item></subnetSet>
+</DescribeSubnetsResponse>`;
+  const assignIpv6 = `<?xml version="1.0" encoding="UTF-8"?>
+<AssignIpv6AddressesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <networkInterfaceId>eni-1</networkInterfaceId>
+</AssignIpv6AddressesResponse>`;
+  const describeEni = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeNetworkInterfacesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <networkInterfaceSet><item>
+    <networkInterfaceId>eni-1</networkInterfaceId>
+    <ipv6AddressesSet>
+      <item><ipv6Address>2600:1f16:abcd::fallback</ipv6Address></item>
+    </ipv6AddressesSet>
+  </item></networkInterfaceSet>
+</DescribeNetworkInterfacesResponse>`;
+  const { calls, fakeFetch } = sequenceRecorder({
+    DescribeInstances: describeInstances,
+    DescribeVpcs: describeVpcs,
+    DescribeSubnets: describeSubnets,
+    AssignIpv6Addresses: assignIpv6,
+    DescribeNetworkInterfaces: describeEni,
+  });
+  const adapter = adapterWith(fakeFetch);
+  const address = await adapter.addPublicIpv6("i-0abc");
+  assertEquals(address, "2600:1f16:abcd::fallback");
+  const actions = calls.map((call) => actionFromBody(String(call.init?.body)));
+  assert(actions.includes("DescribeNetworkInterfaces"));
 });

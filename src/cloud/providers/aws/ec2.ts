@@ -63,6 +63,36 @@ function readCarrierIp(node: XmlElement): string | undefined {
   return undefined;
 }
 
+function firstAddressInSet(
+  node: XmlElement | undefined,
+  setName: string,
+  childName: string,
+): string | undefined {
+  for (const item of childElements(firstChild(node, setName), "item")) {
+    const address = childText(item, childName) ?? item.text;
+    if (address) return address;
+  }
+  return undefined;
+}
+
+function readIpv6FromNetworkInterface(
+  node: XmlElement | undefined,
+): string | undefined {
+  return firstAddressInSet(node, "ipv6AddressesSet", "ipv6Address") ??
+    firstAddressInSet(node, "ipv6sSet", "ipv6Address");
+}
+
+function readIpv6Address(node: XmlElement): string | undefined {
+  const direct = readIpv6FromNetworkInterface(node);
+  if (direct) return direct;
+  const interfaces = firstChild(node, "networkInterfaceSet");
+  for (const item of childElements(interfaces, "item")) {
+    const address = readIpv6FromNetworkInterface(item);
+    if (address) return address;
+  }
+  return undefined;
+}
+
 function mapInstance(node: XmlElement, region: string): Instance {
   const tags = readTags(node);
   return {
@@ -74,6 +104,7 @@ function mapInstance(node: XmlElement, region: string): Instance {
     size: childText(node, "instanceType"),
     image: childText(node, "imageId"),
     publicIp: childText(node, "ipAddress") ?? readCarrierIp(node),
+    publicIpv6: readIpv6Address(node),
     privateIp: childText(node, "privateIpAddress"),
     createdAt: childText(node, "launchTime"),
     tags: Object.keys(tags).length > 0 ? tags : undefined,
@@ -274,10 +305,7 @@ export class Ec2Adapter implements ProviderAdapter {
         userMessage: "该实例没有 VPC 网卡，无法添加 IPv6。",
       });
     }
-    const existingIpv6 = pathText(
-      instance,
-      ["networkInterfaceSet", "item", "ipv6sSet", "item"],
-    );
+    const existingIpv6 = readIpv6Address(instance);
     if (existingIpv6) return existingIpv6;
 
     const vpcRoot = await this.call("DescribeVpcs", { "VpcId.1": vpcId });
@@ -346,7 +374,7 @@ export class Ec2Adapter implements ProviderAdapter {
     });
     const eniResp = firstChild(eniRoot, "DescribeNetworkInterfacesResponse");
     const eni = firstChild(firstChild(eniResp, "networkInterfaceSet"), "item");
-    const fromEni = pathText(eni, ["ipv6sSet", "item"]);
+    const fromEni = eni && readIpv6FromNetworkInterface(eni);
     if (!fromEni) {
       throw new ProviderError("aws", "ipv6 address not assigned", {
         userMessage: "IPv6 已分配，但未能读取到地址，请稍后在面板查看。",
