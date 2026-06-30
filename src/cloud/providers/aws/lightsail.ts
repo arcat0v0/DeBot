@@ -7,6 +7,8 @@ import type { FetchLike } from "../../http.ts";
 import type {
   AdapterContext,
   Capabilities,
+  CatalogBlueprint,
+  CatalogBundle,
   CreateInstanceInput,
   Instance,
   InstanceList,
@@ -30,6 +32,30 @@ interface LsInstance {
   publicIpAddress?: string;
   privateIpAddress?: string;
   createdAt?: number;
+  ipv6Addresses?: string[];
+}
+
+interface LsBundle {
+  bundleId?: string;
+  name?: string;
+  cpuCount?: number;
+  ramSizeInGb?: number;
+  diskSizeInGb?: number;
+  transferPerMonthInGb?: number;
+  price?: number;
+  isActive?: boolean;
+  supportedPlatforms?: string[];
+}
+
+interface LsBlueprint {
+  blueprintId?: string;
+  name?: string;
+  group?: string;
+  type?: string;
+  platform?: string;
+  version?: string;
+  description?: string;
+  isActive?: boolean;
 }
 
 function mapState(name: string | undefined): InstanceState {
@@ -50,6 +76,7 @@ function mapState(name: string | undefined): InstanceState {
 }
 
 function mapInstance(raw: LsInstance): Instance {
+  const ipv6 = raw.ipv6Addresses?.[0];
   return {
     id: raw.name,
     name: raw.name,
@@ -59,6 +86,7 @@ function mapInstance(raw: LsInstance): Instance {
     size: raw.bundleId,
     image: raw.blueprintId,
     publicIp: raw.publicIpAddress,
+    publicIpv6: ipv6,
     privateIp: raw.privateIpAddress,
     createdAt: raw.createdAt
       ? new Date(raw.createdAt * 1000).toISOString()
@@ -120,7 +148,7 @@ export class LightsailAdapter implements ProviderAdapter {
       regionAvailability: false,
       balance: true,
       subscriptionInfo: false,
-      ipv6: false,
+      ipv6: true,
       firewall: false,
       customCreate: true,
     };
@@ -190,5 +218,74 @@ export class LightsailAdapter implements ProviderAdapter {
     throw new ValidationError(
       "AWS Lightsail 不支持重命名实例",
     );
+  }
+
+  async listBundles(): Promise<CatalogBundle[]> {
+    const data = await this.call<{ bundles: LsBundle[] }>("GetBundles", {
+      includeInactive: false,
+    });
+    return (data.bundles ?? [])
+      .filter((bundle) => bundle.isActive !== false)
+      .map((bundle) => ({
+        id: bundle.bundleId ?? "",
+        name: bundle.name ?? bundle.bundleId ?? "",
+        cpuCount: bundle.cpuCount,
+        ramSizeInGb: bundle.ramSizeInGb,
+        diskSizeInGb: bundle.diskSizeInGb,
+        transferPerMonthInGb: bundle.transferPerMonthInGb,
+        price: bundle.price,
+      }));
+  }
+
+  async listBlueprints(): Promise<CatalogBlueprint[]> {
+    const data = await this.call<{ blueprints: LsBlueprint[] }>(
+      "GetBlueprints",
+      { includeInactive: false },
+    );
+    return (data.blueprints ?? [])
+      .filter((bp) => bp.isActive !== false)
+      .map((bp) => ({
+        id: bp.blueprintId ?? "",
+        name: bp.name ?? bp.blueprintId ?? "",
+        group: bp.group,
+        type: bp.type,
+        platform: bp.platform,
+        version: bp.version,
+        description: bp.description,
+      }));
+  }
+
+  async addPublicIpv6(id: string, _locator?: InstanceLocator): Promise<string> {
+    const existing = await this.call<{ instance: LsInstance }>(
+      "GetInstance",
+      { instanceName: id },
+    );
+    const current = existing?.instance?.ipv6Addresses?.[0];
+    if (current) return current;
+
+    await this.call("EnableAddOn", {
+      resourceName: id,
+      addOnRequest: { addOnType: "ipv6" },
+    });
+
+    await this.call("SetIpAddressType", {
+      resourceName: id,
+      resourceType: "Instance",
+      ipAddressType: "dualstack",
+      acceptBundleUpdate: true,
+    });
+
+    for (let attempt = 0; attempt < 12; attempt++) {
+      const data = await this.call<{ instance: LsInstance }>(
+        "GetInstance",
+        { instanceName: id },
+      );
+      const address = data?.instance?.ipv6Addresses?.[0];
+      if (address) return address;
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+    }
+    throw new ProviderError("aws", "ipv6 address not assigned", {
+      userMessage: "IPv6 已启用，但未能读取到地址，请稍后在面板查看。",
+    });
   }
 }

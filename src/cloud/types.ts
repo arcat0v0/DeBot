@@ -162,6 +162,26 @@ export interface DefaultCreateOption {
   osDiskStorageAccountType?: string;
 }
 
+export interface CatalogBundle {
+  id: string;
+  name: string;
+  cpuCount?: number;
+  ramSizeInGb?: number;
+  diskSizeInGb?: number;
+  transferPerMonthInGb?: number;
+  price?: number;
+}
+
+export interface CatalogBlueprint {
+  id: string;
+  name: string;
+  group?: string;
+  type?: string;
+  platform?: string;
+  version?: string;
+  description?: string;
+}
+
 export interface ProviderAdapter {
   readonly id: ProviderId;
   readonly label: string;
@@ -201,6 +221,8 @@ export interface ProviderAdapter {
     ruleName: string,
     locator?: InstanceLocator,
   ): Promise<void>;
+  listBundles?(): Promise<CatalogBundle[]>;
+  listBlueprints?(): Promise<CatalogBlueprint[]>;
 }
 
 export interface AwsCredentials {

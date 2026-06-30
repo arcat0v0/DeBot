@@ -145,3 +145,149 @@ Deno.test("Ec2Adapter builds RunInstances params from a preset", async () => {
   assert(body.includes("KeyName=mykey"));
   assert(body.includes("TagSpecification.1.Tag.1.Key=Name"));
 });
+function actionFromBody(body: string): string {
+  const params = new URLSearchParams(body);
+  return params.get("Action") ?? "";
+}
+
+function sequenceRecorder(responses: Record<string, string>) {
+  const calls: Captured[] = [];
+  const fakeFetch: FetchLike = (input, init) => {
+    calls.push({ url: String(input), init });
+    const action = actionFromBody(String(init?.body ?? ""));
+    const body = responses[action] ?? "<ok/>";
+    return Promise.resolve(
+      new Response(body, {
+        status: 200,
+        headers: { "content-type": "text/xml" },
+      }),
+    );
+  };
+  return { calls, fakeFetch };
+}
+
+Deno.test("Ec2Adapter addPublicIpv6 assigns an address when none exists", async () => {
+  const describeInstances = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <reservationSet><item><instancesSet><item>
+    <instanceId>i-0abc</instanceId>
+    <networkInterfaceSet><item>
+      <networkInterfaceId>eni-1</networkInterfaceId>
+      <vpcId>vpc-1</vpcId>
+      <subnetId>subnet-1</subnetId>
+    </item></networkInterfaceSet>
+  </item></instancesSet></item></reservationSet>
+</DescribeInstancesResponse>`;
+  const describeVpcs = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeVpcsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <vpcSet><item>
+    <vpcId>vpc-1</vpcId>
+    <ipv6CidrBlockAssociationSet>
+      <item><ipv6CidrBlock>2600:1f16:abcd::/56</ipv6CidrBlock></item>
+    </ipv6CidrBlockAssociationSet>
+  </item></vpcSet>
+</DescribeVpcsResponse>`;
+  const describeSubnets = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeSubnetsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <subnetSet><item>
+    <subnetId>subnet-1</subnetId>
+    <ipv6CidrBlockAssociationSet>
+      <item><ipv6CidrBlock>2600:1f16:abcd::/64</ipv6CidrBlock></item>
+    </ipv6CidrBlockAssociationSet>
+  </item></subnetSet>
+</DescribeSubnetsResponse>`;
+  const assignIpv6 = `<?xml version="1.0" encoding="UTF-8"?>
+<AssignIpv6AddressesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <assignedIpv6Addresses><item>2600:1f16:abcd::5</item></assignedIpv6Addresses>
+</AssignIpv6AddressesResponse>`;
+  const { calls, fakeFetch } = sequenceRecorder({
+    DescribeInstances: describeInstances,
+    DescribeVpcs: describeVpcs,
+    DescribeSubnets: describeSubnets,
+    AssignIpv6Addresses: assignIpv6,
+  });
+  const adapter = adapterWith(fakeFetch);
+  const address = await adapter.addPublicIpv6("i-0abc");
+  assertEquals(address, "2600:1f16:abcd::5");
+  const actions = calls.map((call) => actionFromBody(String(call.init?.body)));
+  assert(actions.includes("DescribeInstances"));
+  assert(actions.includes("DescribeVpcs"));
+  assert(actions.includes("DescribeSubnets"));
+  assert(actions.includes("AssignIpv6Addresses"));
+  const assignBody = String(
+    calls.find((c) =>
+      actionFromBody(String(c.init?.body)) === "AssignIpv6Addresses"
+    )?.init?.body,
+  );
+  assert(assignBody.includes("NetworkInterfaceId=eni-1"));
+  assert(assignBody.includes("Ipv6AddressCount=1"));
+});
+
+Deno.test("Ec2Adapter addPublicIpv6 associates CIDRs when missing", async () => {
+  const describeInstances = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <reservationSet><item><instancesSet><item>
+    <instanceId>i-0abc</instanceId>
+    <networkInterfaceSet><item>
+      <networkInterfaceId>eni-1</networkInterfaceId>
+      <vpcId>vpc-1</vpcId>
+      <subnetId>subnet-1</subnetId>
+    </item></networkInterfaceSet>
+  </item></instancesSet></item></reservationSet>
+</DescribeInstancesResponse>`;
+  const describeVpcs = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeVpcsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <vpcSet><item>
+    <vpcId>vpc-1</vpcId>
+    <ipv6CidrBlockAssociationSet>
+      <item><ipv6CidrBlock>2600:1f16:abcd::/56</ipv6CidrBlock></item>
+    </ipv6CidrBlockAssociationSet>
+  </item></vpcSet>
+</DescribeVpcsResponse>`;
+  const describeSubnets = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeSubnetsResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <subnetSet><item>
+    <subnetId>subnet-1</subnetId>
+  </item></subnetSet>
+</DescribeSubnetsResponse>`;
+  const assignIpv6 = `<?xml version="1.0" encoding="UTF-8"?>
+<AssignIpv6AddressesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <assignedIpv6Addresses><item>2600:1f16:abcd::5</item></assignedIpv6Addresses>
+</AssignIpv6AddressesResponse>`;
+  const { calls, fakeFetch } = sequenceRecorder({
+    DescribeInstances: describeInstances,
+    DescribeVpcs: describeVpcs,
+    DescribeSubnets: describeSubnets,
+    AssociateVpcCidrBlock: "<AssociateVpcCidrBlockResponse/>",
+    AssociateSubnetCidrBlock: "<AssociateSubnetCidrBlockResponse/>",
+    AssignIpv6Addresses: assignIpv6,
+  });
+  const adapter = adapterWith(fakeFetch);
+  const address = await adapter.addPublicIpv6("i-0abc");
+  assertEquals(address, "2600:1f16:abcd::5");
+  const actions = calls.map((call) => actionFromBody(String(call.init?.body)));
+  assert(actions.includes("AssociateSubnetCidrBlock"));
+  assert(!actions.includes("AssociateVpcCidrBlock"));
+});
+
+Deno.test("Ec2Adapter addPublicIpv6 returns existing IPv6 without changes", async () => {
+  const describeInstances = `<?xml version="1.0" encoding="UTF-8"?>
+<DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
+  <reservationSet><item><instancesSet><item>
+    <instanceId>i-0abc</instanceId>
+    <networkInterfaceSet><item>
+      <networkInterfaceId>eni-1</networkInterfaceId>
+      <vpcId>vpc-1</vpcId>
+      <subnetId>subnet-1</subnetId>
+      <ipv6sSet><item>2600:1f16:abcd::existing</item></ipv6sSet>
+    </item></networkInterfaceSet>
+  </item></instancesSet></item></reservationSet>
+</DescribeInstancesResponse>`;
+  const { calls, fakeFetch } = sequenceRecorder({
+    DescribeInstances: describeInstances,
+  });
+  const adapter = adapterWith(fakeFetch);
+  const address = await adapter.addPublicIpv6("i-0abc");
+  assertEquals(address, "2600:1f16:abcd::existing");
+  assertEquals(calls.length, 1);
+});

@@ -143,7 +143,7 @@ export class Ec2Adapter implements ProviderAdapter {
       regionAvailability: false,
       balance: true,
       subscriptionInfo: false,
-      ipv6: false,
+      ipv6: true,
       firewall: false,
       customCreate: true,
     };
@@ -245,5 +245,125 @@ export class Ec2Adapter implements ProviderAdapter {
       "Tag.1.Key": "Name",
       "Tag.1.Value": name,
     });
+  }
+  async addPublicIpv6(id: string): Promise<string> {
+    const describeRoot = await this.call("DescribeInstances", {
+      "InstanceId.1": id,
+    });
+    const response = firstChild(describeRoot, "DescribeInstancesResponse");
+    const reservation = firstChild(
+      firstChild(response, "reservationSet"),
+      "item",
+    );
+    const instance = firstChild(
+      firstChild(reservation, "instancesSet"),
+      "item",
+    );
+    if (!instance) throw new NotFoundError(`instance ${id} not found`);
+    const vpcId = pathText(instance, ["networkInterfaceSet", "item", "vpcId"]);
+    const subnetId = pathText(
+      instance,
+      ["networkInterfaceSet", "item", "subnetId"],
+    );
+    const eniId = pathText(
+      instance,
+      ["networkInterfaceSet", "item", "networkInterfaceId"],
+    );
+    if (!vpcId || !subnetId || !eniId) {
+      throw new ProviderError("aws", "instance has no VPC network interface", {
+        userMessage: "该实例没有 VPC 网卡，无法添加 IPv6。",
+      });
+    }
+    const existingIpv6 = pathText(
+      instance,
+      ["networkInterfaceSet", "item", "ipv6sSet", "item"],
+    );
+    if (existingIpv6) return existingIpv6;
+
+    const vpcRoot = await this.call("DescribeVpcs", { "VpcId.1": vpcId });
+    const vpcResp = firstChild(vpcRoot, "DescribeVpcsResponse");
+    const vpc = firstChild(firstChild(vpcResp, "vpcSet"), "item");
+    if (!vpc) throw new NotFoundError(`vpc ${vpcId} not found`);
+    const vpcIpv6Prefix = this.firstIpv6Prefix(vpc);
+    if (!vpcIpv6Prefix) {
+      await this.call("AssociateVpcCidrBlock", {
+        VpcId: vpcId,
+        AmazonProvidedIpv6CidrBlock: "true",
+      });
+    }
+
+    const subnetRoot = await this.call("DescribeSubnets", {
+      "SubnetId.1": subnetId,
+    });
+    const subnetResp = firstChild(subnetRoot, "DescribeSubnetsResponse");
+    const subnet = firstChild(firstChild(subnetResp, "subnetSet"), "item");
+    if (!subnet) throw new NotFoundError(`subnet ${subnetId} not found`);
+    const subnetIpv6Prefix = this.firstIpv6Prefix(subnet);
+    if (!subnetIpv6Prefix) {
+      let v6Cidr = vpcIpv6Prefix;
+      if (!v6Cidr) {
+        const refreshedVpcRoot = await this.call("DescribeVpcs", {
+          "VpcId.1": vpcId,
+        });
+        const refreshedVpc = firstChild(
+          firstChild(
+            firstChild(refreshedVpcRoot, "DescribeVpcsResponse"),
+            "vpcSet",
+          ),
+          "item",
+        );
+        v6Cidr = this.firstIpv6Prefix(refreshedVpc);
+      }
+      if (!v6Cidr) {
+        throw new ProviderError(
+          "aws",
+          "vpc has no ipv6 cidr after associate",
+          {
+            userMessage: "VPC 未拿到 IPv6 CIDR，无法为子网配置 IPv6。",
+          },
+        );
+      }
+      const subnetCidr = v6Cidr.replace(/\/\d+$/, "/64");
+      await this.call("AssociateSubnetCidrBlock", {
+        SubnetId: subnetId,
+        Ipv6CidrBlock: subnetCidr,
+      });
+    }
+
+    const assignRoot = await this.call("AssignIpv6Addresses", {
+      NetworkInterfaceId: eniId,
+      Ipv6AddressCount: "1",
+    });
+    const assignResp = firstChild(assignRoot, "AssignIpv6AddressesResponse");
+    const assignedItem = pathText(assignResp, [
+      "assignedIpv6Addresses",
+      "item",
+    ]);
+    if (assignedItem) return assignedItem;
+
+    const eniRoot = await this.call("DescribeNetworkInterfaces", {
+      "NetworkInterfaceId.1": eniId,
+    });
+    const eniResp = firstChild(eniRoot, "DescribeNetworkInterfacesResponse");
+    const eni = firstChild(firstChild(eniResp, "networkInterfaceSet"), "item");
+    const fromEni = pathText(eni, ["ipv6sSet", "item"]);
+    if (!fromEni) {
+      throw new ProviderError("aws", "ipv6 address not assigned", {
+        userMessage: "IPv6 已分配，但未能读取到地址，请稍后在面板查看。",
+      });
+    }
+    return fromEni;
+  }
+
+  private firstIpv6Prefix(node: XmlElement | undefined): string | undefined {
+    const set = node && (
+      firstChild(node, "ipv6CidrBlockAssociationSet") ??
+        firstChild(node, "ipv6CidrBlockSet")
+    );
+    for (const item of childElements(set, "item")) {
+      const block = childText(item, "ipv6CidrBlock");
+      if (block) return block;
+    }
+    return undefined;
   }
 }

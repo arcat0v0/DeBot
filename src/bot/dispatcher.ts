@@ -2,6 +2,8 @@ import type { Logger } from "../app/logger.ts";
 import { toUserMessage, ValidationError } from "../shared/errors.ts";
 import { PROVIDER_IDS, PROVIDER_LABELS } from "../cloud/types.ts";
 import type {
+  CatalogBlueprint,
+  CatalogBundle,
   CreateInstanceInput,
   FirewallProtocol,
   FirewallRuleInput,
@@ -600,6 +602,9 @@ export class Dispatcher {
       case "jobs":
         await this.showJobs(surface);
         return;
+      case "lg":
+        await this.handleLightsailCatalogCallback(user, surface, parts, ack);
+        return;
       case "noop":
         await ack();
         return;
@@ -817,6 +822,163 @@ export class Dispatcher {
       );
     }
   }
+  private async handleLightsailCatalogCallback(
+    user: TgUser,
+    surface: Surface,
+    parts: string[],
+    ack: (text?: string, alert?: boolean) => Promise<void>,
+  ): Promise<void> {
+    const provider = "aws";
+    const service = decodeService(parts[2]);
+    const action = parts[3];
+
+    if (action === "bp") {
+      await this.showLightsailBundles(surface, provider, service);
+      return;
+    }
+
+    if (action === "bpsel") {
+      const bundleId = parts[4];
+      if (!bundleId) {
+        await ack("缺少套餐", true);
+        return;
+      }
+      await this.showLightsailBlueprints(surface, provider, service, bundleId);
+      return;
+    }
+
+    if (action === "blsel") {
+      const bundleId = parts[4];
+      const blueprintId = parts[5];
+      if (!bundleId || !blueprintId) {
+        await ack("缺少套餐或镜像", true);
+        return;
+      }
+      const profile = await this.deps.profiles.getActive(provider);
+      const region = this.regionFor(
+        surface,
+        provider,
+        profile?.defaultRegion,
+        service,
+      );
+      this.deps.sessions.setFlow(user.id, {
+        kind: "lightsail_catalog_create",
+        service,
+        region,
+        bundleId,
+        blueprintId,
+        chatId: surface.chatId,
+        messageId: surface.messageId,
+      });
+      await ack();
+      await this.deps.api.sendMessage({
+        chat_id: surface.chatId,
+        text: [
+          "请发送实例名称（可发送 - 使用自动命名）。",
+          "",
+          `套餐：${code(bundleId)}`,
+          `镜像：${code(blueprintId)}`,
+        ].join("\n"),
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    await this.showCreateMenu(surface, provider, service);
+  }
+
+  private async showLightsailBundles(
+    surface: Surface,
+    provider: ProviderId,
+    service: string,
+  ): Promise<void> {
+    const pc = providerCode(provider);
+    const sc = serviceCode(service);
+    const adapter = await this.deps.cloud.getAdapter(provider, { service });
+    if (!adapter.listBundles) {
+      await this.showCreateMenu(surface, provider, service);
+      return;
+    }
+    let bundles: CatalogBundle[];
+    try {
+      bundles = await adapter.listBundles();
+    } catch (error) {
+      await this.showMenu(
+        surface,
+        `无法加载 Lightsail 套餐：${escapeHtml(toUserMessage(error))}`,
+        keyboard([[button("⬅️ 返回", `cr:${pc}:${sc}`)]]),
+      );
+      return;
+    }
+    if (bundles.length === 0) {
+      await this.showMenu(
+        surface,
+        "未找到可用的 Lightsail 套餐。",
+        keyboard([[button("⬅️ 返回", `cr:${pc}:${sc}`)]]),
+      );
+      return;
+    }
+    const rows = bundles.map((bundle) => [
+      button(
+        `${bundle.name} · ${bundle.cpuCount ?? "?"}vCPU / ${
+          bundle.ramSizeInGb ?? "?"
+        }GB`,
+        `lg:${pc}:${sc}:bpsel:${bundle.id}`,
+      ),
+    ]);
+    rows.push([button("⬅️ 返回", `cr:${pc}:${sc}`)]);
+    await this.showMenu(
+      surface,
+      `${bold("选择 Lightsail 套餐")}\n共 ${bundles.length} 个套餐。`,
+      keyboard(rows),
+    );
+  }
+
+  private async showLightsailBlueprints(
+    surface: Surface,
+    provider: ProviderId,
+    service: string,
+    bundleId: string,
+  ): Promise<void> {
+    const pc = providerCode(provider);
+    const sc = serviceCode(service);
+    const adapter = await this.deps.cloud.getAdapter(provider, { service });
+    if (!adapter.listBlueprints) {
+      await this.showCreateMenu(surface, provider, service);
+      return;
+    }
+    let blueprints: CatalogBlueprint[];
+    try {
+      blueprints = await adapter.listBlueprints();
+    } catch (error) {
+      await this.showMenu(
+        surface,
+        `无法加载 Lightsail 镜像：${escapeHtml(toUserMessage(error))}`,
+        keyboard([[button("⬅️ 返回", `lg:${pc}:${sc}:bp`)]]),
+      );
+      return;
+    }
+    if (blueprints.length === 0) {
+      await this.showMenu(
+        surface,
+        "未找到可用的 Lightsail 镜像。",
+        keyboard([[button("⬅️ 返回", `lg:${pc}:${sc}:bp`)]]),
+      );
+      return;
+    }
+    const rows = blueprints.map((bp) => [
+      button(
+        `${bp.name}${bp.version ? ` ${bp.version}` : ""}`,
+        `lg:${pc}:${sc}:blsel:${bundleId}:${bp.id}`,
+      ),
+    ]);
+    rows.push([button("⬅️ 返回", `lg:${pc}:${sc}:bp`)]);
+    await this.showMenu(
+      surface,
+      `${bold("选择 Lightsail 镜像")}\n共 ${blueprints.length} 个镜像。`,
+      keyboard(rows),
+    );
+  }
 
   private async showHelp(surface: Surface): Promise<void> {
     const text = [
@@ -901,7 +1063,11 @@ export class Dispatcher {
     const serviceLabel = adapter.label;
 
     const rows = [[button("📋 实例列表", `ls:${pc}:${sc}`)]];
-    if (caps.create) rows.push([button("➕ 用预设创建", `cr:${pc}:${sc}`)]);
+    if (caps.create) {
+      rows.push([
+        button(this.createButtonLabel(provider, service), `cr:${pc}:${sc}`),
+      ]);
+    }
     const infoRow = [];
     if (caps.subscriptionInfo) {
       infoRow.push(button("🎓 订阅类型", `az:${pc}:${sc}:sub`));
@@ -1000,7 +1166,7 @@ export class Dispatcher {
         surface,
         `${bold(adapter.label)}\n未找到实例。`,
         keyboard([
-          [button("➕ 用预设创建", `cr:${pc}:${sc}`)],
+          [button(this.createButtonLabel(provider, service), `cr:${pc}:${sc}`)],
           [
             button("🔄 刷新", `ls:${pc}:${sc}`),
             button("⬅️ 返回", `svc:${pc}:${sc}`),
@@ -1543,12 +1709,17 @@ export class Dispatcher {
     this.editJobMessage(surface, provider, service, label, job);
   }
 
+  private createButtonLabel(provider: ProviderId, service: string): string {
+    return provider === "aws" && service === "lightsail"
+      ? "➕ 创建实例"
+      : "➕ 用预设创建";
+  }
+
   private async showCreateMenu(
     surface: Surface,
     provider: ProviderId,
     service: string,
   ): Promise<void> {
-    const presets = await this.deps.presets.listByProvider(provider);
     const pc = providerCode(provider);
     const sc = serviceCode(service);
     const rows = [];
@@ -1572,20 +1743,32 @@ export class Dispatcher {
         button("📡 Wavelength 最小机器", `aw:${pc}:${sc}:create`),
       ]);
     }
-    if (presets.length === 0) {
-      lines.push("", `还没有 ${PROVIDER_LABELS[provider]} 预设。`);
-    } else {
-      lines.push("", "保存的预设：");
-      for (const preset of presets) {
-        rows.push([
-          button(
-            `📦 ${preset.name}（${preset.size}）`,
-            `mk:${pc}:${sc}:${preset.id}`,
-          ),
-        ]);
-      }
+    if (provider === "aws" && service === "lightsail") {
+      lines.push(
+        "",
+        "Lightsail 使用官方套餐与镜像创建实例，无需预设。",
+      );
+      rows.push([
+        button("📦 选择套餐创建", `lg:${pc}:${sc}:bp`),
+      ]);
     }
-    rows.push([button("📦 管理预设", "pst:home")]);
+    if (provider !== "aws" || service !== "lightsail") {
+      const presets = await this.deps.presets.listByProvider(provider);
+      if (presets.length === 0) {
+        lines.push("", `还没有 ${PROVIDER_LABELS[provider]} 预设。`);
+      } else {
+        lines.push("", "保存的预设：");
+        for (const preset of presets) {
+          rows.push([
+            button(
+              `📦 ${preset.name}（${preset.size}）`,
+              `mk:${pc}:${sc}:${preset.id}`,
+            ),
+          ]);
+        }
+      }
+      rows.push([button("📦 管理预设", "pst:home")]);
+    }
     rows.push([button("⬅️ 返回", `svc:${pc}:${sc}`)]);
     await this.showMenu(surface, lines.join("\n"), keyboard(rows));
   }
@@ -1859,6 +2042,51 @@ export class Dispatcher {
         parse_mode: "HTML",
       });
       await this.showPresets(surface);
+      return;
+    }
+    if (flow.kind === "lightsail_catalog_create") {
+      const name = text.trim() || `debot-${Date.now()}`;
+      this.deps.sessions.clearFlow(user.id);
+      const label = `创建 Lightsail 实例 ${name}`;
+      const job = this.deps.jobs.enqueue({
+        kind: "create",
+        label,
+        provider: "aws",
+        userId: user.id,
+        run: async () => {
+          const adapter = await this.deps.cloud.getAdapter("aws", {
+            service: flow.service,
+            region: flow.region,
+          });
+          const instance = await adapter.createInstance({
+            name,
+            region: flow.region,
+            image: flow.blueprintId,
+            size: flow.bundleId,
+            tags: { createdBy: "DeBot", source: "lightsail-catalog" },
+          });
+          return `已创建 ${instance.name}（${instance.id}）`;
+        },
+        onUpdate: (record) =>
+          this.editJobMessage(
+            { chatId: flow.chatId, messageId: flow.messageId },
+            "aws",
+            flow.service,
+            label,
+            record,
+          ),
+      });
+      await this.deps.api.sendMessage({
+        chat_id: surface.chatId,
+        text: "创建任务已加入队列。",
+      });
+      this.editJobMessage(
+        { chatId: flow.chatId, messageId: flow.messageId },
+        "aws",
+        flow.service,
+        label,
+        job,
+      );
       return;
     }
 

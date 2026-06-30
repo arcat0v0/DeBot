@@ -60,6 +60,15 @@ export type Flow =
     chatId: number;
     messageId?: number;
   }
+  | {
+    kind: "lightsail_catalog_create";
+    service: string;
+    region?: string;
+    bundleId: string;
+    blueprintId: string;
+    chatId: number;
+    messageId?: number;
+  }
   | { kind: "add_preset"; provider: ProviderId };
 
 export interface Session {
